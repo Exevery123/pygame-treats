@@ -226,6 +226,27 @@ def linear_v(w, h, top, bot):
     return s
 
 
+def _clip_line(a, b, r):
+    """The part of line a-b inside rect r (Liang-Barsky), or None."""
+    x0, y0 = a
+    dx, dy = b[0] - x0, b[1] - y0
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x0 - r.left), (dx, r.right - x0), (-dy, y0 - r.top), (dy, r.bottom - y0)):
+        if p == 0:
+            if q < 0:
+                return None
+            continue
+        t = q / p
+        if p < 0:
+            t0 = max(t0, t)
+        else:
+            t1 = min(t1, t)
+        if t0 > t1:
+            return None
+    pa = a if t0 == 0 else (x0 + dx * t0, y0 + dy * t0)
+    return pa, (x0 + dx * t1, y0 + dy * t1)
+
+
 # --- the drawing context ----------------------------------------------------------------
 class Ctx:
     def __init__(self, surf):
@@ -315,6 +336,7 @@ class Ctx:
 
     def _fill_screen_rect(self, rect, col):
         r, g, b, a = col
+        rect = rect.clip(self.surf.get_clip())   # (a see-through fill only needs the part that shows)
         if a <= 0 or rect.w <= 0 or rect.h <= 0:
             return
         if self.comp == 'lighter':
@@ -491,12 +513,58 @@ class Ctx:
             else:
                 self._fill_poly(p[0], col)
 
+    def setLineDash(self, seg):
+        self.dash = list(seg) if seg else None
+
+    # Cut the path into the "on" pieces of the dash pattern (screen pixels).
+    def _dashed(self, paths):
+        k = self._scale_k()
+        pat = [max(0.5, d * k) for d in self.dash]
+        out = []
+        for p in paths:
+            if isinstance(p, tuple):
+                _, cx, cy, r = p
+                n = max(12, int(r / 3))
+                pts = [(cx + r * math.cos(i / n * math.pi * 2), cy + r * math.sin(i / n * math.pi * 2)) for i in range(n)]
+                closed = True
+            else:
+                pts, closed = p
+            if closed and pts:
+                pts = list(pts) + [pts[0]]
+            i, left, on, cur = 0, pat[0], True, None
+            clip = self.surf.get_clip().inflate(8, 8)
+            for a, b in zip(pts, pts[1:]):
+                ab = _clip_line(a, b, clip)
+                if not ab:
+                    cur = None   # off screen: nothing to cut up
+                    continue
+                if ab[0] != a:
+                    cur = None
+                a, b = ab
+                seg = math.hypot(b[0] - a[0], b[1] - a[1])
+                t = 0.0
+                while seg - t > 1e-9:
+                    step = min(left, seg - t)
+                    p0 = (a[0] + (b[0] - a[0]) * t / seg, a[1] + (b[1] - a[1]) * t / seg)
+                    t += step
+                    p1 = (a[0] + (b[0] - a[0]) * t / seg, a[1] + (b[1] - a[1]) * t / seg)
+                    if on:
+                        if cur is None:
+                            cur = [p0]
+                            out.append([cur, False])
+                        cur.append(p1)
+                    left -= step
+                    if left <= 1e-9:
+                        i = (i + 1) % len(pat)
+                        left, on, cur = pat[i], not on, None
+        return out
+
     def stroke(self):
         col = self._rgba(self.strokeStyle)
         if col[3] <= 0:
             return
         wdt = max(1, int(round(self.lineWidth * self._scale_k())))
-        for p in self.paths:
+        for p in (self._dashed(self.paths) if getattr(self, 'dash', None) else self.paths):
             if isinstance(p, tuple):
                 self._fill_circle(p[1], p[2], p[3], col, wdt)
                 continue

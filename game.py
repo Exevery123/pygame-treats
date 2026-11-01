@@ -88,6 +88,8 @@ PHYS = O(
     packSmash=1.15,        # smash speed down
     packDiveX=1.08,        # dive forward speed
     packDiveGravity=0.8,   # dive falls slower, so it lasts longer
+    wingSpeed=330,         # wings: how fast W / S fly Charlie up and down (px/s)
+    wingAccel=2400,        # ...and how quickly he gets to that speed
     hurtImmune=1,          # seconds of blinking (no damage) after the eight pack takes a hit
 
     trampoline=960,
@@ -162,6 +164,8 @@ links, portals = [], {}
 views, camLikes = [], []
 crumbleState = {}
 trampAnim = {}
+# Forest Depths things: endless-looking walls, winged treats, falling ceilings (see sectionTools)
+endlessWalls, wingTreats, slabs = [], [], []
 
 
 # Builders for one section. `shift` / `dy` slide them to wherever the section sits in the world.
@@ -307,6 +311,7 @@ def sectionTools(shift, dy=0):
     # A secret area. cells: [[x, y], ...]. opts.flood: also everything joined to them through
     # open dirt background (not into opts.except). opts.seeX: when inside, everything from that
     # column rightward still shows. opts.name names it; opts.also: secrets that show along with it.
+    # opts.keepOutside: when inside, the world outside it still shows (only it opens up).
     def secret(cells, opts=None):
         opts = opts or {}
 
@@ -333,7 +338,7 @@ def sectionTools(shift, dy=0):
                     if is_open(nx, ny):
                         todo.append([nx, ny])
         secrets.append(O(cells=out, seeX=opts['seeX'] + shift if 'seeX' in opts else None,
-                         name=opts.get('name', ''), also=opts.get('also', [])))
+                         name=opts.get('name', ''), also=opts.get('also', []), keepOutside=bool(opts.get('keepOutside'))))
     t.secret = secret
     t.view = lambda v: views.append(O(v, edge=v['edge'] + shift))
     t.cameraLike = lambda x, y, w, h, pairs: camLikes.append(O(x=X(x), y=Y(y), w=w * T, h=h * T, pairs=pairs))
@@ -347,6 +352,40 @@ def sectionTools(shift, dy=0):
         global finish
         finish = O(x=X(x) + T / 2, y=Y(G))
     t.setFinish = setFinish
+
+    # A door (standing on row `floor`) that's just a black hole. Up takes you to hole door `to`
+    # in this same area.
+    t.holeDoor = lambda x, floor, id, to: doors.append(O(x=X(x), y=Y(floor) - 2 * T, w=T, h=2 * T, id=id, here=to,
+                                                          lockedT=0, hole=True))
+    # Ground columns x0..x1 (rows top..bottom) that hide what's past them: from the left it looks
+    # like column x0 - 1 goes on forever to the right, and from the right like column x1 + 1
+    # goes on forever to the left.
+    t.endlessWall = lambda x0, x1, top, bottom: endlessWalls.append(O(x0=x0 + shift, x1=x1 + shift, y0=top + dy, y1=bottom + dy))
+    # A treat with wings flying round and round through the middles of tiles pts ([[x, y], ...]),
+    # speed tiles a second. Eat it for wings: W / S fly, and one extra hit (like a turkey leg).
+    t.wingedTreat = lambda pts, speed: wingTreats.append(O(
+        m=pathOf([[X(x) + T / 2, Y(y) + T / 2] for x, y in pts], True), speed=speed * T, d=0, t=0, x=None, y=None))
+
+    # The tiles in columns x0..x1, rows top..bottom drop at `speed` tiles a second once Charlie
+    # touches row `trigger` (same columns), until something solid is under them. Spikes on
+    # them hurt; being squashed into the ground kills.
+    def dropCeiling(x0, x1, top, bottom, trigger, speed):
+        slabs.append(O(x0=x0 + shift, x1=x1 + shift, y0=top + dy, h=bottom - top + 1, trig=trigger + dy, speed=speed,
+                       p=0, row=0, max=0, moving=False, cells=None, under={}))
+    t.dropCeiling = dropCeiling
+
+    # Bob the Square standing on row `floor`, saying each line once, when its trigger first
+    # comes true: near=tiles from Bob / at=[x, y, tiles] (tiles from a chunk tile) /
+    # secret=name (Charlie inside that secret); got=greenie id: only once it's been grabbed.
+    # {name} in a line is Charlie's name; *words* come out slowly.
+    def talkingBob(x, floor, says):
+        def one(o):
+            o = O(o, done=False)
+            if o.at:
+                o.at = [X(o.at[0]) + T / 2, Y(o.at[1]) + T / 2, o.at[2]]
+            return o
+        npcs.append(O(kind='bobTalk', x=X(x) + T / 2, feet=Y(floor), say=None, says=[one(o) for o in says]))
+    t.talkingBob = talkingBob
     return t
 
 
@@ -518,7 +557,7 @@ def warpOnGreenie(id, to):
 
 # --- chunk codes (shared with the editor) ----------------------------
 CHUNK_PREFIX = 'TREATS1:'
-CHUNK_TILES = 'g^T~'   # tiles the editor can place
+CHUNK_TILES = 'g^T~o'   # tiles the editor can place (o = cobblestone)
 
 
 def b64encode(s):
@@ -572,6 +611,8 @@ def encodeChunk(chunk):
         data.p = chunk.place
     if chunk.fires:
         data.fb = chunk.fires
+    if chunk.clouds:
+        data.cl = chunk.clouds
     if chunk.notes:
         data.nt = chunk.notes
     return CHUNK_PREFIX + b64encode(js_json(data))
@@ -594,7 +635,7 @@ def decodeChunk(code):
         trees=d.get('tr') or [], treats=d.get('ts') or [], greenies=d.get('gr') or [], cps=d.get('cp') or [],
         texts=[[t[0], t[1], t[4], t[5]] if len(t) >= 6 else t for t in (d.get('tx') or [])],
         chickens=d.get('ck') or [], diamonds=d.get('dm') or [], notes=d.get('nt') or [], place=O(d['p']) if d.get('p') else None,
-        fires=d.get('fb') or [],
+        fires=d.get('fb') or [], clouds=d.get('cl') or [],
     )
 
 
@@ -699,6 +740,9 @@ def clearWorld():
 
 # "Play test" from the command line: python main.py --test TREATS1:... (that chunk alone, between two pads).
 TEST_CODE = sys.argv[sys.argv.index('--test') + 1] if '--test' in sys.argv[:-1] else None
+if TEST_CODE and TEST_CODE.startswith('@'):   # --test @file: the code is in that file (the editor's Play)
+    with open(TEST_CODE[1:], encoding='utf8') as _f:
+        TEST_CODE = _f.read().strip()
 
 
 def _start_pad(t):
@@ -715,19 +759,10 @@ TEST_PADS = [
 ]
 
 
-def buildLevel():
-    global LW, GH, grid, bgGrid, signs, checkpoints, treats, greenies, trees, texts, movers, lasers
-    global chickens, houses, doors, npcs, props, diamonds, sectionSpans, switches, secrets, links, portals
-    global activeSecret, views, camLikes, fireSpawners, fireballs, backdrop, dimness, turkeys, spawn, finish
-    global baseGrid, secretMap
-    order = AREAS.get(areaName) or []
-    if TEST_CODE:
-        try:
-            order = [TEST_PADS[0], chunkSection(decodeChunk(TEST_CODE)), TEST_PADS[1]]
-        except Exception as e:
-            print('Bad test code:', e)
-    # Where each section sits, in tiles: the main row runs left to right with the bottoms
-    # lined up, and placed sections go where they say (possibly above / below).
+# Where each section sits, in tiles: the main row runs left to right with the bottoms
+# lined up, and placed sections go where they say (possibly above / below).
+# Returns {id(section): [x, y]} (the editor's Generate world uses it too).
+def layoutSections(order):
     pos = {}
     rowX = [0]
 
@@ -749,7 +784,22 @@ def buildLevel():
                 pos[id(sec)] = [pos[id(ref)][0] + p.dx, pos[id(ref)][1] + p.dy]
     for sec in order:
         if id(sec) not in pos:
-            inRow(sec)
+            inRow(sec)   # its anchor is missing
+    return pos
+
+
+def buildLevel():
+    global LW, GH, grid, bgGrid, signs, checkpoints, treats, greenies, trees, texts, movers, lasers
+    global chickens, houses, doors, npcs, props, diamonds, sectionSpans, switches, secrets, links, portals
+    global activeSecret, views, camLikes, fireSpawners, fireballs, backdrop, dimness, turkeys, spawn, finish
+    global baseGrid, secretMap, endlessWalls, wingTreats, slabs
+    order = AREAS.get(areaName) or []
+    if TEST_CODE:
+        try:
+            order = [TEST_PADS[0], chunkSection(decodeChunk(TEST_CODE)), TEST_PADS[1]]
+        except Exception as e:
+            print('Bad test code:', e)
+    pos = layoutSections(order)
     minX, minY, maxX, maxY = 0, 0, 0, LH
     for sec in order:
         x, y = pos[id(sec)]
@@ -761,6 +811,7 @@ def buildLevel():
     chickens = []; houses = []; doors = []; npcs = []; props = []; diamonds = []; sectionSpans = []
     switches = []; secrets = []; links = []; portals = {}; activeSecret = 0; views = []; camLikes = []
     fireSpawners = []; fireballs = []
+    endlessWalls = []; wingTreats = []; slabs = []
     backdrop = 'sky'; dimness = 0; turkeys = []
     spawn = None; finish = None   # a world made only of chunks may have neither
     crumbleState.clear(); trampAnim.clear()
@@ -831,7 +882,7 @@ def trunkPush(x, y, w, h, tr):
     return best
 
 
-SOLID_CHARS = set('#gX~T><wpklf')
+SOLID_CHARS = set('#gX~T><wpklfo')
 
 
 def isSolidChar(c):
@@ -944,7 +995,7 @@ def resetPlayer(at):
         coyote=0, jumpBuf=0, wallLock=0, diveReady=True, canCut=False,
         combo=0, landT=1, smashLand=0, slideLock=0, ride=None,
         flip=0, flipping=False, runPhase=0, wallSliding=False, wallDir=0,
-        deadT=0, squash=0, squashV=0, eightPack=False, immune=0,
+        deadT=0, squash=0, squashV=0, eightPack=False, wings=False, immune=0,
     )
 
 
@@ -1054,9 +1105,9 @@ def teleport(to, arrive=None, spot=None):
         respawnPoint = cp
         for c in checkpoints:
             c.active = abs(c.x - cp.x) < 2 and abs(c.y - cp.y) < 2
-    pk = P.eightPack
+    pk, wg = P.eightPack, P.wings
     resetPlayer(at)
-    P.eightPack = pk   # the eight pack comes along, like stamina
+    P.eightPack = pk; P.wings = wg   # the eight pack and wings come along, like stamina
     particles = []; celebrate = None; inhale = None; slurps = []; thrown = []; flyingLegs = []
     snapCamera(at)
 
@@ -1082,7 +1133,7 @@ def respawn():
         # a death puts both areas back the way they were built
         areaGrids.pop(frm, None); areaGrids.pop(areaName, None)
         grid = [r[:] for r in baseGrid]
-        P.eightPack = False; stamina = 0
+        P.eightPack = False; P.wings = False; stamina = 0
         return
     resetPlayer(respawnPoint)
     celebrate = None
@@ -1092,6 +1143,10 @@ def respawn():
         c.taken = False
     for tk in turkeys:
         tk.t = 0
+    for w in wingTreats:
+        w.t = 0; w.d = 0
+    for sl in slabs:   # (the grid reset put it back up)
+        sl.update(p=0, row=0, moving=False, cells=None); sl.under.clear()
     for g in greenies:
         g.taken = False
     stamina = 0
@@ -1134,16 +1189,24 @@ def updateSwitches():
         shake = 6
 
 
-# Spikes, lasers, chickens, fireballs. With an eight pack you lose that instead of your life.
+# Spikes, lasers, chickens, fireballs. With wings or an eight pack you lose that instead of
+# your life (wings first: they burst into feathers; a turkey leg flies out of you).
 def hurt():
     global shake
     if P.state == 'dead' or P.immune > 0:
         return
-    if not P.eightPack:
+    if not P.eightPack and not P.wings:
         return die()
-    P.eightPack = False; P.immune = PHYS.hurtImmune
+    P.immune = PHYS.hurtImmune
     P.vy = min(P.vy, -420)   # a little hop up, off whatever got you
     shake = 5
+    if P.wings:
+        P.wings = False
+        for i in range(16):
+            spawnParticle(P.x + P.w / 2, P.y + P.h * 0.4, (random() - 0.5) * 320, -random() * 260, 1 + random() * 0.6, 4,
+                          '#ffffff' if i % 3 else '#d9dee6', 250)
+        return
+    P.eightPack = False
     flyingLegs.append(O(x=P.x + P.w / 2, y=P.y + P.h / 2, vx=-P.facing * 160 + (random() - 0.5) * 80, vy=-520, rot=0,
                         spin=(-1 if random() < 0.5 else 1) * 9, t=0))
 
@@ -1171,7 +1234,7 @@ def die():
     global deaths, shake
     if P.state == 'dead':
         return
-    P.eightPack = False; P.immune = 0
+    P.eightPack = False; P.wings = False; P.immune = 0
     cx, cy = P.x + P.w / 2, P.y + P.h / 2
     for i in range(26):
         a, s = random() * math.pi * 2, 120 + random() * 380
@@ -1419,6 +1482,7 @@ def breakBlock(tx, ty):
 #  Player update
 # ---------------------------------------------------------------------
 def updatePlayer(dt):
+    global warp
     if P.state == 'dead':
         P.deadT -= dt
         if P.deadT <= 0:
@@ -1430,7 +1494,10 @@ def updatePlayer(dt):
         d = next((d for d in doors if overlap(P.x, P.y, P.w, P.h, d.x + 4, d.y, d.w - 8, d.h)), None)
         if d:
             # a door to an area that isn't built yet just rattles
-            if areaExists(d.to):
+            if d.here:
+                if not warp:
+                    warp = O(local=d, t=0, done=False)
+            elif areaExists(d.to):
                 startWarp(d.to, d.arrive)
             else:
                 d.lockedT = 1.4
@@ -1517,7 +1584,7 @@ def updatePlayer(dt):
                 dive(dir)
     if divePressed and not P.onGround and P.coyote <= 0 and P.diveReady and P.state == 'normal':
         dive(dir)
-    if downPressed and not P.onGround and P.coyote <= 0 and P.state in ('normal', 'dive'):
+    if downPressed and not P.wings and not P.onGround and P.coyote <= 0 and P.state in ('normal', 'dive'):
         smash()
 
     # --- variable jump height
@@ -1529,7 +1596,12 @@ def updatePlayer(dt):
     # --- gravity + wall slide
     g = PHYS.diveGravity * pack(PHYS.packDiveGravity) if P.state == 'dive' else PHYS.gravity
     maxFall = PHYS.smashMaxFall * pack(PHYS.packSmash) if P.state == 'smash' else PHYS.maxFall
-    P.vy = min(P.vy + g * dt, maxFall)
+    if P.wings and not P.onGround:
+        # wings: no falling; W flies up, S flies down, neither hovers
+        v = (1 if held('down') else 0) - (1 if held('up') else 0)
+        P.vy = approach(P.vy, v * PHYS.wingSpeed, PHYS.wingAccel * dt)
+    else:
+        P.vy = min(P.vy + g * dt, maxFall)
     P.wallSliding = False
     if not P.onGround and P.state == 'normal' and dir != 0 and P.vy > 0 and touchingWall(dir):
         P.wallSliding = True; P.wallDir = dir; P.facing = -dir; P.flipping = False
@@ -2060,7 +2132,7 @@ INHALE = O(
     spitSpeed=700, chickenSpeed=800,   # how fast blocks / chickens come out
     kick=360, kickMax=850,             # push on Charlie per item, and his top speed from it
 )
-INHALE_TILES = 'g#X~T^><'
+INHALE_TILES = 'g#X~T^><'   # (not cobblestone 'o': too heavy)
 stamina = 0
 staminaFlash = 0
 inhale = None    # { phase: 'suck' | 'hold' | 'spit', t, aim, dir, things }
@@ -2303,6 +2375,88 @@ def fireSettings(s):
     return O(FIRE_DEFAULTS, **(s or {}))
 
 
+# ---------------------------------------------------------------------
+#  Clouds (the editor's Cloud tool, chunk field cl = [[x, y, settings]]).
+#  The game doesn't build them yet; the editor draws and moves them.
+# ---------------------------------------------------------------------
+CLOUD_DEFAULTS = dict(
+    w=4,            # tiles wide
+    scale=1,        # puff size (1 = normal)
+    mode='lr',      # 'still' | 'lr' (left and right) | 'ud' (up and down) | 'ellipse' | 'path'
+    dist=6,         # lr / ud: tiles it travels (negative goes left / up first)
+    rx=4,           # ellipse: centre to side, tiles (the centre is home)
+    ry=2,           # ellipse: centre to top, tiles
+    ccw=False,      # ellipse: anticlockwise
+    pts=[],         # path: [[dx, dy], ...] tiles from home that the cloud's middle passes through
+    loop=False,     # path: from the last point straight back to the first (else back and forth)
+    speed=2,        # tiles per second
+    start=0,        # % of the way along the trip where it starts
+)
+
+
+def cloudSettings(s):
+    out = O(CLOUD_DEFAULTS, **(s or {}))
+    out.pts = [list(p) for p in out.pts]
+    return out
+
+
+# The points the cloud's top-left corner goes through (tiles from home), and whether they loop.
+def cloudTrip(s):
+    if s.mode == 'lr':
+        return [[0, 0], [s.dist, 0]], False
+    if s.mode == 'ud':
+        return [[0, 0], [0, s.dist]], False
+    if s.mode == 'ellipse':
+        n, d = 64, -1 if s.ccw else 1
+        return [[s.rx * math.cos(d * i / n * math.pi * 2), s.ry * math.sin(d * i / n * math.pi * 2)] for i in range(n)], True
+    if s.mode == 'path':
+        return [[0, 0]] + s.pts, bool(s.loop and len(s.pts) > 1)
+    return [[0, 0]], False
+
+
+def makeCloud(x, y, st):   # x, y: home top-left in pixels
+    s = cloudSettings(st)
+    pts, loop = cloudTrip(s)
+    pts = [[x + px * T, y + py * T] for px, py in pts]
+    n = len(pts) if loop else len(pts) - 1
+    ln = sum(math.hypot(pts[(i + 1) % len(pts)][0] - pts[i][0], pts[(i + 1) % len(pts)][1] - pts[i][1]) for i in range(n))
+    m = O(pts=pts, loop=loop, len=ln, speed=s.speed * T, w=s.w * T, scale=s.scale, hx=x, hy=y)
+    m.s0 = s.start / 100 * (ln if loop else 2 * ln)
+    m.x, m.y = cloudAt(m, m.s0)
+    return m
+
+
+# Where a cloud is once it has gone d pixels: round and round a loop, or there and back.
+def cloudAt(m, d):
+    pts, ln, loop = m.pts, m.len, m.loop
+    if not ln:
+        return pts[0]
+    trip = ln if loop else 2 * ln
+    s = d % trip
+    if s > ln:
+        s = trip - s
+    segs = len(pts) if loop else len(pts) - 1
+    for i in range(segs):
+        a, b = pts[i], pts[(i + 1) % len(pts)]
+        l = math.hypot(b[0] - a[0], b[1] - a[1])
+        if s <= l or i == segs - 1:
+            k = min(1, s / l) if l else 0
+            return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k]
+        s -= l
+
+
+# A fluffy cloud whose flat top is at y: a row of puffs, grey-blue underneath.
+def drawCloud(x, y, w, s=1):
+    n = max(2, round(w / (24 * s)))
+    step = w / n
+    for col, dy in (('#c9d6e8', 4 * s), ('#ffffff', 0)):
+        ctx.fillStyle = col
+        for i in range(n):
+            r = (13 + ((i * 5) % 3) * 2) * s
+            ctx.beginPath(); ctx.arc(x + step * (i + 0.5), y + 14 * s + dy, r, 0, math.pi * 2); ctx.fill()
+        ctx.fillRect(x + 4 * s, y + 12 * s + dy, w - 8 * s, 12 * s)
+
+
 def pick(r):
     a, b = r
     return a + random() * (b - a)
@@ -2425,6 +2579,8 @@ def drawFireWarnings():
                 warn.append(w)
     m = 20
     for w in warn:
+        if behindEndlessWall(w.x, w.y):
+            continue   # (it would give the trick away)
         x = w.x - camX if w.here else max(m, min(VIEW_W - m, w.x - camX))
         y = w.y - camY if w.here else max(m, min(VIEW_H - m, w.y - camY))
         hurry = 1 - w.t / WARN_TIME
@@ -2519,7 +2675,11 @@ def update(dt):
         # the world holds still while the screen fades
         warp.t += dt
         if not warp.done and warp.t >= WARP_TIME:
-            teleport(warp.to, warp.arrive, warp.spot); warp.done = True; easyScene = None
+            if warp.local:
+                throughLocalDoor(warp.local)
+            else:
+                teleport(warp.to, warp.arrive, warp.spot)
+            warp.done = True; easyScene = None
         if easyScene:
             simTime += dt; easyScene.n.wordT += dt
         if warp.t >= WARP_TIME * 2:
@@ -2565,6 +2725,8 @@ def update(dt):
             trampAnim[key] = nv
 
     updatePlayer(dt)
+    updateSlabs(dt)
+    updateWingTreats(dt)
     updateLinks()
     updateSwitches()
     updateInhale(dt)
@@ -2598,7 +2760,7 @@ COL = O(
     tramp='#e74c3c', boost='#1abc9c',
     mover='#5e81ac', moverTop='#81a1c1',
     laser='#ff2d55',
-    grass='#5cbf4a', dirt='#9b6a3c', dirtBg='#6b4526', trunk='#7a4a24',
+    grass='#5cbf4a', dirt='#9b6a3c', dirtBg='#6b4526', cobble='#835832', cobbleCrack='#4a2e17', trunk='#7a4a24',
 )
 
 screen = None
@@ -2652,11 +2814,13 @@ def drawWorld(sx, sy):
     drawFinish()
     drawLasers()
     drawTiles(x0, x1, y0, y1)
+    drawSlabs()
     drawProps()
     drawTrees()
     drawTexts()
     drawMovers()
     drawTreats()
+    drawWingTreats()
     drawGreenies()
     drawDiamonds()
     drawNpcs()
@@ -2710,6 +2874,7 @@ def draw():
         drawCelebrationBackdrop()
     drawPlayer()
     drawParticles()
+    drawEndlessWalls(sx, sy)
     drawDim()
     drawNpcTalk()
     drawPopups()
@@ -2724,6 +2889,7 @@ def draw():
     else:
         if not ui and not warp:
             drawFireWarnings()
+            drawFarTalk()
         if ui:
             drawUI()
         drawHUD()
@@ -2766,6 +2932,8 @@ def coveredAt(tx, ty):
     if not activeSecret:
         return id > 0
     z = secrets[activeSecret - 1]
+    if z.keepOutside and not id:
+        return False
     return id != activeSecret and id not in z.alsoIds and not (z.seeX is not None and tx >= z.seeX)
 
 
@@ -2793,12 +2961,21 @@ def drawSwitches():
         ctx.beginPath(); ctx.ellipse(sw.x + sw.w / 2, sw.y + 3, sw.w / 2, sw.h, 0, 0, math.pi); ctx.fill()
 
 
+# cobblestone cracks, three looks picked by the tile's spot: lists of [x, y] points in the tile
+CRACKS = [
+    [[[5, 4], [11, 12], [9, 19]], [[11, 12], [18, 14]], [[24, 24], [28, 29]]],
+    [[[22, 5], [17, 13], [21, 22], [16, 28]], [[17, 13], [11, 15]]],
+    [[[6, 22], [13, 25], [19, 21]], [[24, 8], [28, 15]], [[8, 6], [12, 9]]],
+]
+
+
 def drawTiles(x0, x1, y0, y1):
+    falling = any(sl.moving for sl in slabs)   # (a falling ceiling is drawn smoothly by drawSlabs)
     for ty in range(y0, y1 + 1):
         row = grid[ty]
         for tx in range(x0, x1 + 1):
             c = row[tx]
-            if c != '.' and c != 'c':
+            if c != '.' and c != 'c' and not (falling and slabAt(tx, ty)):
                 drawTile(c, tx * T, ty * T, tx, ty)
 
 
@@ -2877,6 +3054,15 @@ def drawTile(c, px, py, tx=None, ty=None):
             ctx.fillRect(px + 22, py + 11, 1, 10)
         if not loose and not isSolidChar(tileAt(tx, ty - 1)):
             ctx.fillStyle = '#80583a'; ctx.fillRect(px, py, sw, 3)
+    elif c == 'o':
+        # cobblestone: darker dirt with cracks (too heavy to inhale)
+        ctx.fillStyle = COL.cobble; ctx.fillRect(px, py, sw, sh)
+        ctx.strokeStyle = COL.cobbleCrack; ctx.lineWidth = 2
+        ctx.beginPath()
+        for line in CRACKS[0 if loose else (tx * 7 + ty * 5) % len(CRACKS)]:
+            for i, (x, y) in enumerate(line):
+                (ctx.lineTo if i else ctx.moveTo)(px + x, py + y)
+        ctx.stroke()
     elif c == 'k':
         # bridge plank: boards across, dark gaps between them, rope rails along the edges
         ctx.fillStyle = '#b07a45'; ctx.fillRect(px, py + 6, sw, 18)
@@ -3139,6 +3325,11 @@ def drawHouses():
         if d.x > camX + VIEW_W or d.x + d.w < camX:
             continue
         jig = math.sin(simTime * 70) * 2 if d.lockedT > 1 else 0   # rattles when locked
+        if d.hole:
+            drawHole(d)
+            if P.state != 'dead' and overlap(P.x, P.y, P.w, P.h, d.x + 4, d.y, d.w - 8, d.h):
+                drawUpArrow(d.x + d.w / 2, d.y - 18)
+            continue
         if d.framed:
             ctx.fillStyle = '#7a5232'; ctx.fillRect(d.x - 3, d.y - 2, d.w + 6, d.h + 2)
         ctx.fillStyle = '#8d5a3b'; ctx.fillRect(d.x + 3 + jig, d.y + 4, d.w - 6, d.h - 4)
@@ -3186,7 +3377,7 @@ def drawNpcs():
         if n.kind == 'grandma':
             drawGrandma(n)
             continue
-        img = bobTalkImg if bobMouthOpen(n) else bobImg
+        img = bobTalkImg if (bobTalkMouth(n) if n.kind == 'bobTalk' else bobMouthOpen(n)) else bobImg
         if not img.naturalWidth:
             continue
         w = h = 36   # Bob stays completely stiff
@@ -3274,6 +3465,8 @@ def drawPlayer():
     if P.immune > 0 and math.floor(P.immune * 14) % 2 == 0:
         return   # blinking
     cx, feet = P.x + P.w / 2, P.y + P.h
+    if P.wings:
+        drawWings(cx, feet - CHARLIE_H * 0.62, 22 if held('up') else 10, 1)
     spd = min(1, abs(P.vx) / PHYS.runMax)
     s, rot, lean, hop, jitter = P.squash, 0, 0, 0, 0
 
@@ -3519,12 +3712,18 @@ def drawStamina():
     if label:
         ctx.fillStyle = '#ff8a80'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
         ctx.fillText(label, barX + barW + 10, y + 21)
+    px = x - 4 + barW + 34 + 12 + lw + 8
     if P.eightPack:
         # the eight pack: one extra hit
-        px = x - 4 + barW + 34 + 12 + lw + 8
         ctx.fillStyle = 'rgba(20,22,26,0.6)'
         ctx.beginPath(); ctx.roundRect(px, y, 40, bh + 24, 8); ctx.fill()
         drawTurkeyImg(px + 20, y + 20, 30, 0.5 + math.sin(simTime * 3) * 0.08)
+        px += 48
+    if P.wings:
+        # wings: another extra hit
+        ctx.fillStyle = 'rgba(20,22,26,0.6)'
+        ctx.beginPath(); ctx.roundRect(px, y, 40, bh + 24, 8); ctx.fill()
+        drawWings(px + 20, y + 20, 6, 0.8)
 
 
 # Every greenie in the game (all areas' chunks, plus whatever is built right now).
@@ -4260,7 +4459,7 @@ def makeSaveCode():
     return SAVE_PREFIX + b64encode(js_json({
         'g': list(greeniesGot), 'h': stuff.hat, 'i': stuff.inv, 'd': stuff.diamonds,
         'n': stuff.gameName, 'r': stuff.realName, 'b': stuff.bobGone, 'f': stuff.flags, 'gm': stuff.grandmaDone,
-        'st': stamina, 'ep': bool(P.eightPack), 'df': difficulty,
+        'st': stamina, 'ep': bool(P.eightPack), 'wg': bool(P.wings), 'df': difficulty,
         # where you are: the area, where Charlie stands, and the checkpoint you'd respawn at
         'l': {'a': areaName, 'at': spotOf(P.x + P.w / 2, P.y + P.h),
               'cp': lastCp.spot if lastCp else spotOf(respawnPoint.x, respawnPoint.y),
@@ -4573,7 +4772,7 @@ def npcLines(n):
 
 
 def npcTalking(n):
-    return n.talk is not None and 0 <= n.talk < len(npcLines(n)) and not (n.kind == 'bob' and stuff.bobGone)
+    return n.kind != 'bobTalk' and n.talk is not None and 0 <= n.talk < len(npcLines(n)) and not (n.kind == 'bob' and stuff.bobGone)
 
 
 def npcLine(n):
@@ -4595,6 +4794,9 @@ def bobMouthOpen(n):
 
 def updateNpcs(dt):
     for n in npcs:
+        if n.kind == 'bobTalk':
+            updateBobTalk(n, dt)
+            continue
         if n.kind == 'bob' and stuff.bobGone:
             continue
         if n.talk is None:
@@ -4664,6 +4866,11 @@ BOB_WRAP = 22   # letters per line
 
 def drawNpcTalk():
     for n in npcs:
+        if n.kind == 'bobTalk':
+            b = bobTalkBox(n)
+            if b and b.inView:
+                drawPixelText(b.text, b.x, b.y, '#000000')
+            continue
         if not npcTalking(n):
             continue
         lines = wrapWords(npcLine(n), BOB_WRAP)
@@ -4756,7 +4963,7 @@ def continueSave():
     deaths = 0; runTime = 0; finished = False; lastCp = None; areaGrids = {}
     stamina = d.get('st') or 0
     startWarp(loc['a'], None, loc)
-    P.eightPack = bool(d.get('ep'))
+    P.eightPack = bool(d.get('ep')); P.wings = bool(d.get('wg'))
 
 
 def startGame(i, white=False):
@@ -5022,3 +5229,278 @@ def boot():
         draw()
         pygame.display.flip()
         clock.tick(60)
+
+
+# --- Bob who talks when things happen (t.talkingBob). Each line comes out a word at a time
+# (*slow* words much slower), stays a few seconds, then he goes quiet. When he's off screen,
+# his words show at the edge of the screen instead, so you still hear him.
+SLOW_WORD = 0.8   # seconds for each *slow* word
+SAY_HOLD = 4      # seconds a line stays once it's all out
+
+
+def lineWords(line):
+    import re
+    out, t = [], 0
+    for w in line.replace('{name}', playerName()).split(' '):
+        out.append(O(w=w.replace('*', ''), at=t))
+        t += SLOW_WORD if re.match(r'^\*.+\*\W*$', w) else WORD_TIME
+    return out
+
+
+def updateBobTalk(n, dt):
+    if n.say:
+        n.say.t += dt
+    if P.state == 'dead':
+        return
+    cx, cy = P.x + P.w / 2, P.y + P.h / 2
+
+    def tiles(x, y):   # diagonals count the same
+        return max(abs(cx - x), abs(cy - y)) / T
+    id = secretAt(math.floor(cx / T), math.floor(cy / T))
+    for o in n.says:
+        if o.done or (o.got and not any(g.id == o.got and g.taken for g in greenies)):
+            continue
+        if o.near is not None:
+            now = tiles(n.x, n.feet - 18) <= o.near
+        elif o.at:
+            now = tiles(o.at[0], o.at[1]) <= o.at[2]
+        elif o.secret:
+            now = id > 0 and secrets[id - 1].name == o.secret
+        else:
+            now = False
+        if not now:
+            continue
+        o.done = True
+        n.say = O(words=lineWords(o.line), t=0)   # (a newer line cuts in)
+
+
+def sayShown(say):
+    return sum(1 for w in say.words if w.at <= say.t)
+
+
+def bobTalkMouth(n):
+    return bool(n.say) and sayShown(n.say) < len(n.say.words) and sayShown(n.say) % 2 == 1
+
+
+# Where his words go above his head (world pixels), the words out so far, and whether it's on screen.
+def bobTalkBox(n):
+    say = n.say
+    if not say or say.t > say.words[-1].at + SAY_HOLD:
+        return None
+    lines = wrapWords(' '.join(w.w for w in say.words), BOB_WRAP)
+    left, shown = sayShown(say), []
+    for l in lines:
+        w = l.split(' ')
+        shown.append(' '.join(w[:max(0, left)])); left -= len(w)
+    sz = pixelTextSize('\n'.join(lines))
+    x, y = n.x - sz.w / 2, n.feet - 36 - 20 - sz.h
+    inView = x >= camX and x + sz.w <= camX + VIEW_W and y >= camY and y + sz.h <= camY + VIEW_H
+    return O(text='\n'.join(shown), x=x, y=y, w=sz.w, h=sz.h, inView=inView)
+
+
+# (screen space) Bob's words at the screen edge nearest him while he's out of sight.
+def drawFarTalk():
+    for n in npcs:
+        if n.kind != 'bobTalk':
+            continue
+        b = bobTalkBox(n)
+        if not b or b.inView:
+            continue
+        pad, k = 10, 0.8
+        w, h = b.w * k + pad * 2, (b.h + 26) * k + pad * 2
+        bx = max(10, min(VIEW_W - w - 10, n.x - camX - w / 2))
+        by = 60 if n.feet < camY + VIEW_H / 2 else VIEW_H - h - 60   # (clear of the HUD)
+        ctx.fillStyle = 'rgba(20,22,26,0.72)'
+        ctx.beginPath(); ctx.roundRect(bx, by, w, h, 8); ctx.fill()
+        ctx.save(); ctx.translate(bx + pad, by + pad); ctx.scale(k, k)
+        drawPixelText('BOB:', 0, 0, '#ffb27a')
+        drawPixelText(b.text, 0, 26, '#ffffff')
+        ctx.restore()
+
+
+# --- black hole doors (t.holeDoor): a black blot with a soft dark rim, slowly breathing
+def drawHole(d):
+    cx, cy, k = d.x + d.w / 2, d.y + d.h / 2, 1 + math.sin(simTime * 2.5 + d.x) * 0.04
+    for sc, a in ((1.5, 0.12), (1.25, 0.25), (1.08, 0.5)):
+        ctx.fillStyle = 'rgba(0,0,0,%s)' % a
+        ctx.beginPath(); ctx.ellipse(cx, cy, d.w / 2 * sc * k, d.h / 2 * sc * k, 0, 0, math.pi * 2); ctx.fill()
+    ctx.fillStyle = '#040406'
+    ctx.beginPath(); ctx.ellipse(cx, cy, d.w / 2 * k, d.h / 2 * k, 0, 0, math.pi * 2); ctx.fill()
+
+
+# Through a door to another door in the same area: everything stays.
+def throughLocalDoor(d):
+    o = next((x for x in doors if x.id == d.here), None)
+    if o:
+        placeCharlie(o.x + o.w / 2, o.y + o.h)
+
+
+def placeCharlie(cx, feet):
+    P.x = cx - P.w / 2; P.y = feet - P.h; P.vx = P.vy = 0; P.ride = None
+    snapCamera(O(x=cx, y=feet))
+
+
+# Is world spot (x, y) hidden past an endless wall, from the side Charlie is on?
+def behindEndlessWall(x, y):
+    cx = P.x + P.w / 2
+    for e in endlessWalls:
+        if not (e.y0 * T <= y < (e.y1 + 1) * T):
+            continue
+        if cx < e.x0 * T and x >= e.x0 * T or cx >= (e.x1 + 1) * T and x < (e.x1 + 1) * T:
+            return True
+    return False
+
+
+# --- endless walls (t.endlessWall): from one side, the column next to the wall is drawn again
+# and again over the wall and everything past it, as if the place went on forever.
+def drawEndlessWalls(sx, sy):
+    if not endlessWalls:
+        return
+    cx = P.x + P.w / 2
+    for e in endlessWalls:
+        left, right = cx < e.x0 * T, cx >= (e.x1 + 1) * T
+        if not left and not right:
+            continue
+        src = e.x0 - 1 if left else e.x1 + 1
+        vx0, vx1 = math.floor(camX / T) - 1, math.ceil((camX + VIEW_W) / T) + 1
+        frm, to = (max(e.x0, vx0), vx1) if left else (vx0, min(e.x1, vx1))
+        ty0, ty1 = max(e.y0, math.floor(camY / T) - 1), min(e.y1, math.ceil((camY + VIEW_H) / T) + 1)
+        if frm > to or ty0 > ty1:
+            continue
+        # the sky / backdrop first, only over the part being covered
+        ctx.save()
+        ctx.setTransform()
+        ctx.clip_rect(frm * T - camX - sx, ty0 * T - camY - sy, (to - frm + 1) * T, (ty1 - ty0 + 1) * T)
+        drawBackdrop()
+        ctx.translate(-round(camX + sx), -round(camY + sy))
+        for ty in range(ty0, ty1 + 1):
+            c, bg = grid[ty][src], bgAt(src, ty)
+            for tx in range(frm, to + 1):
+                if bg:
+                    ctx.fillStyle = COL.dirtBg; ctx.fillRect(tx * T, ty * T, T + 1, T + 1)
+                if c != '.' and c != 'c':
+                    drawTile(c, tx * T, ty * T, src, ty)
+        ctx.restore()
+
+
+# --- winged treats (t.wingedTreat)
+def pathOf(pts, loop):
+    """A path through pixel points for cloudAt: its points, whether it loops, and its length."""
+    n = len(pts) if loop else len(pts) - 1
+    ln = sum(math.hypot(pts[(i + 1) % len(pts)][0] - pts[i][0], pts[(i + 1) % len(pts)][1] - pts[i][1]) for i in range(n))
+    return O(pts=pts, loop=loop, len=ln)
+
+
+def updateWingTreats(dt):
+    global stamina
+    cx, cy = P.x + P.w / 2, P.y + P.h / 2
+    for w in wingTreats:
+        w.d += w.speed * dt
+        if w.t > 0:
+            w.t -= dt   # eaten: grows back
+            continue
+        w.x, w.y = cloudAt(w.m, w.d)
+        if P.state == 'dead' or abs(w.x - cx) > P.w / 2 + 12 or abs(w.y - cy) > P.h / 2 + 12:
+            continue
+        w.t = 4
+        eatTreat(); P.wings = True
+        for i in range(12):
+            spawnParticle(w.x, w.y, (random() - 0.5) * 220, (random() - 0.5) * 220, 0.5, 3, '#ffffff' if i % 2 else '#7bb661', 0)
+
+
+def drawWingTreats():
+    for w in wingTreats:
+        if w.t > 0 or w.x is None:
+            continue
+        drawWings(w.x, w.y - 4, 18, 0.7)
+        drawSweetPotato(w.x, w.y, math.sin(simTime * 3) * 0.2)
+
+
+# A pair of white feathered wings around (x, y), flapping at `rate`; s = size.
+def drawWings(x, y, rate, s):
+    flap = math.sin(simTime * rate) * 0.55
+    for side in (-1, 1):
+        ctx.save()
+        ctx.translate(x + side * 9 * s, y); ctx.rotate(side * (-0.35 + flap)); ctx.scale(side * s, s)
+        ctx.fillStyle = '#ffffff'; ctx.strokeStyle = '#b9c2cf'; ctx.lineWidth = 1.5
+        ctx.beginPath(); ctx.ellipse(12, -4, 15, 7, -0.35, 0, math.pi * 2); ctx.fill(); ctx.stroke()
+        ctx.beginPath(); ctx.ellipse(8, 2, 10, 5, -0.1, 0, math.pi * 2); ctx.fill(); ctx.stroke()
+        ctx.restore()
+
+
+# --- falling ceilings (t.dropCeiling). It moves down the grid a tile at a time (so it's solid
+# like any ground) and is drawn between the steps where it really is; its spikes hurt from there.
+def slabAt(tx, ty):
+    for sl in slabs:
+        if sl.moving and sl.x0 <= tx <= sl.x1 and sl.y0 + sl.row <= ty < sl.y0 + sl.row + sl.h and \
+                sl.cells[ty - sl.y0 - sl.row][tx - sl.x0] != '.':
+            return True
+    return False
+
+
+def slabStep(sl):
+    w = sl.x1 - sl.x0 + 1
+    for r in range(sl.h):   # lift it out, putting back what it covered
+        for i in range(w):
+            if sl.cells[r][i] == '.':
+                continue
+            ty, tx = sl.y0 + sl.row + r, sl.x0 + i
+            grid[ty][tx] = sl.under.pop(ty * LW + tx, '.')
+    sl.row += 1
+    for r in range(sl.h):   # and down a row
+        for i in range(w):
+            if sl.cells[r][i] == '.':
+                continue
+            ty, tx = sl.y0 + sl.row + r, sl.x0 + i
+            sl.under[ty * LW + tx] = grid[ty][tx]
+            grid[ty][tx] = sl.cells[r][i]
+    if P.state != 'dead' and rectHitsSolid(P.x, P.y, P.w, P.h):
+        die()   # squashed
+
+
+def updateSlabs(dt):
+    global shake
+    for sl in slabs:
+        if not sl.moving:
+            if sl.row or sl.cells or P.state == 'dead':
+                continue   # (already came down)
+            if not overlap(P.x, P.y, P.w, P.h, sl.x0 * T, sl.trig * T, (sl.x1 - sl.x0 + 1) * T, T):
+                continue
+            sl.cells = [grid[sl.y0 + r][sl.x0:sl.x1 + 1] for r in range(sl.h)]
+            # it can come down until the row under it has something solid in it
+            sl.max = 0
+            while sl.y0 + sl.h + sl.max < GH and not any(isSolidChar(c) for c in grid[sl.y0 + sl.h + sl.max][sl.x0:sl.x1 + 1]):
+                sl.max += 1
+            sl.moving = sl.max > 0
+            shake = 4
+            continue
+        sl.p = min(sl.max, sl.p + sl.speed * dt)
+        while sl.row < math.floor(sl.p):
+            slabStep(sl)
+        if sl.p >= sl.max:
+            sl.moving = False; shake = 6
+        # its spikes, where they are right now
+        off = (sl.p - sl.row) * T
+        hx, hy, hw, hh = P.x + 3, P.y + 3, P.w - 6, P.h - 6
+        hit = False
+        for r in range(sl.h):
+            for i in range(sl.x1 - sl.x0 + 1):
+                if sl.cells[r][i] != '^' or P.state == 'dead':
+                    continue
+                bx, by, bw, bh = spikeBox(sl.x0 + i, sl.y0 + sl.row + r)
+                if overlap(hx, hy, hw, hh, bx, by + off, bw, bh):
+                    hit = True
+        if hit:
+            hurt()
+
+
+def drawSlabs():
+    for sl in slabs:
+        if not sl.moving:
+            continue
+        off = (sl.p - sl.row) * T
+        for r in range(sl.h):
+            for i in range(sl.x1 - sl.x0 + 1):
+                c = sl.cells[r][i]
+                if c != '.':
+                    drawTile(c, (sl.x0 + i) * T, (sl.y0 + sl.row + r) * T + off, sl.x0 + i, sl.y0 + sl.row + r)
