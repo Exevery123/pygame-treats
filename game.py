@@ -164,8 +164,14 @@ links, portals = [], {}
 views, camLikes = [], []
 crumbleState = {}
 trampAnim = {}
-# Forest Depths things: endless-looking walls, winged treats, falling ceilings (see sectionTools)
-endlessWalls, wingTreats, slabs = [], [], []
+# Greenie Temples Part 2 things: endless-looking walls, winged treats, falling ceilings,
+# rooms that fill with spikes (see sectionTools)
+endlessWalls, wingTreats, slabs, spikeRooms = [], [], [], []
+# Locked doors (solid 'L' tiles with keyholes) and the keys that open them.
+lockDoors, doorKeys = [], []
+# Teleporter pads (t.teleporter) and the giant chicken: giantSpec from t.giantChicken,
+# giant = the chicken while it's out.
+teleporters, giantSpec, giant = [], None, None
 
 
 # Builders for one section. `shift` / `dy` slide them to wherever the section sits in the world.
@@ -175,6 +181,13 @@ def sectionTools(shift, dy=0):
 
     def X(x):
         return (x + shift) * T
+
+    # A piece of ground that sinks when a spike room shuts (see spikeRoom's lower).
+    def sinking(l):
+        sl = O(x0=l['x0'] + shift, x1=l['x1'] + shift, y0=l['row'] + dy, h=1, trig=None, speed=l['speed'],
+               end=l['row'] + l['by'] + dy, land=True, twin=l.get('twin'), p=0, moving=False, cells=None, turns=None)
+        slabs.append(sl)
+        return sl
 
     def setc(x, y, c):
         x += shift
@@ -312,6 +325,7 @@ def sectionTools(shift, dy=0):
     # open dirt background (not into opts.except). opts.seeX: when inside, everything from that
     # column rightward still shows. opts.name names it; opts.also: secrets that show along with it.
     # opts.keepOutside: when inside, the world outside it still shows (only it opens up).
+    # opts.showFrom: tiles [x0, y0, x1, y1] (inclusive): it also shows while Charlie is in that box.
     def secret(cells, opts=None):
         opts = opts or {}
 
@@ -337,8 +351,10 @@ def sectionTools(shift, dy=0):
                 for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
                     if is_open(nx, ny):
                         todo.append([nx, ny])
+        sf = opts.get('showFrom')
         secrets.append(O(cells=out, seeX=opts['seeX'] + shift if 'seeX' in opts else None,
-                         name=opts.get('name', ''), also=opts.get('also', []), keepOutside=bool(opts.get('keepOutside'))))
+                         name=opts.get('name', ''), also=opts.get('also', []), keepOutside=bool(opts.get('keepOutside')),
+                         showFrom=[X(sf[0]), Y(sf[1]), X(sf[2] + 1), Y(sf[3] + 1)] if sf else None, showing=False))
     t.secret = secret
     t.view = lambda v: views.append(O(v, edge=v['edge'] + shift))
     t.cameraLike = lambda x, y, w, h, pairs: camLikes.append(O(x=X(x), y=Y(y), w=w * T, h=h * T, pairs=pairs))
@@ -357,35 +373,135 @@ def sectionTools(shift, dy=0):
     # in this same area.
     t.holeDoor = lambda x, floor, id, to: doors.append(O(x=X(x), y=Y(floor) - 2 * T, w=T, h=2 * T, id=id, here=to,
                                                           lockedT=0, hole=True))
-    # Ground columns x0..x1 (rows top..bottom) that hide what's past them: from the left it looks
-    # like column x0 - 1 goes on forever to the right, and from the right like column x1 + 1
-    # goes on forever to the left.
-    t.endlessWall = lambda x0, x1, top, bottom: endlessWalls.append(O(x0=x0 + shift, x1=x1 + shift, y0=top + dy, y1=bottom + dy))
+    # Columns x0..x1 (rows top..bottom) become a wall that can't be inhaled and hides what's past
+    # it: from either side there's only solid dirt out there, with cobblestone along the bottom row.
+    def endlessWall(x0, x1, top, bottom):
+        fill(x0, top, x1 - x0 + 1, bottom - top + 1, 'o')
+        endlessWalls.append(O(x0=x0 + shift, x1=x1 + shift, y0=top + dy, y1=bottom + dy))
+    t.endlessWall = endlessWall
     # A treat with wings flying round and round through the middles of tiles pts ([[x, y], ...]),
     # speed tiles a second. Eat it for wings: W / S fly, and one extra hit (like a turkey leg).
     t.wingedTreat = lambda pts, speed: wingTreats.append(O(
         m=pathOf([[X(x) + T / 2, Y(y) + T / 2] for x, y in pts], True), speed=speed * T, d=0, t=0, x=None, y=None))
 
     # The tiles in columns x0..x1, rows top..bottom drop at `speed` tiles a second once Charlie
-    # touches row `trigger` (same columns), until something solid is under them. Spikes on
-    # them hurt; being squashed into the ground kills.
-    def dropCeiling(x0, x1, top, bottom, trigger, speed):
+    # touches row `trigger` (same columns), straight through anything in the way, until their
+    # top reaches row `end`. Spikes on them hurt; being caught in the rest squashes him.
+    def dropCeiling(x0, x1, top, bottom, trigger, speed, end):
         slabs.append(O(x0=x0 + shift, x1=x1 + shift, y0=top + dy, h=bottom - top + 1, trig=trigger + dy, speed=speed,
-                       p=0, row=0, max=0, moving=False, cells=None, under={}))
+                       end=end + dy, p=0, moving=False, cells=None, turns=None))
     t.dropCeiling = dropCeiling
+
+    # A room that slams shut and fills with spikes when something starts it (see the Bob line's
+    # start). start: the top-left open tile; box: tiles [x0, y0, x1, y1] it's all inside; seal:
+    # tiles that close it off; bounds: tiles [x0, y0, x1, y1] launched spikes vanish outside of.
+    # lower: {x0, x1, row, by, speed, twin: [dx, dy]}: that row of ground (and Bob, who stands on
+    # it) sinks `by` tiles as the room shuts; when it stops, a copy of it appears dx, dy tiles away.
+    def spikeRoom(id, o):
+        b, bd = o['box'], o['bounds']
+        spikeRooms.append(O(id=id, phase=None, t=0,
+                            start=[o['start'][0] + shift, o['start'][1] + dy],
+                            box=[b[0] + shift, b[1] + dy, b[2] + shift, b[3] + dy],
+                            seal=[[x + shift, y + dy] for x, y in o['seal']],
+                            bounds=[X(bd[0]), Y(bd[1]), X(bd[2] + 1), Y(bd[3] + 1)],
+                            line=[], left=[], spikes=[], blasters=[], dots=[], set=0, redOrder=[], reds=[], redT=0, placed=0, started=0, launched=0,
+                            lower=sinking(o['lower']) if o.get('lower') else None))
+    t.spikeRoom = spikeRoom
 
     # Bob the Square standing on row `floor`, saying each line once, when its trigger first
     # comes true: near=tiles from Bob / at=[x, y, tiles] (tiles from a chunk tile) /
-    # secret=name (Charlie inside that secret); got=greenie id: only once it's been grabbed.
-    # {name} in a line is Charlie's name; *words* come out slowly.
+    # secret=[names] (Charlie inside one of those secrets); got=greenie id: only once it's been
+    # grabbed. {name} in a line is Charlie's name. start: spike room id, set off `delay` seconds
+    # after the line.
     def talkingBob(x, floor, says):
         def one(o):
             o = O(o, done=False)
             if o.at:
                 o.at = [X(o.at[0]) + T / 2, Y(o.at[1]) + T / 2, o.at[2]]
             return o
-        npcs.append(O(kind='bobTalk', x=X(x) + T / 2, feet=Y(floor), say=None, says=[one(o) for o in says]))
+        npcs.append(O(kind='bobTalk', x=X(x) + T / 2, feet=Y(floor), home=Y(floor), say=None, says=[one(o) for o in says]))
     t.talkingBob = talkingBob
+
+    # A locked door filling w x h tiles from (x, y), with `holes` keyholes. Keys (t.key with
+    # the same id) go in when Charlie brings them close; with all of them in it opens for good
+    # (stuff.flags[id]).
+    def lockDoor(x, y, w, h, id, holes):
+        if stuff.flags.get(id):
+            return
+        cells = []
+        for ty in range(y, y + h):
+            for tx in range(x, x + w):
+                setc(tx, ty, 'L'); cells.append([tx + shift, ty + dy])
+        lockDoors.append(O(id=id, x=X(x), y=Y(y), w=w * T, h=h * T, cells=cells, holes=holes, filled=0, next=0, openT=0))
+    t.lockDoor = lockDoor
+
+    # A key for lock door `door`, sitting at tile (x, y). Touch it and it follows Charlie.
+    # Once it's in its hole it stays there for good (stuff.flags[id]).
+    def key(x, y, door, id):
+        d = next((o for o in lockDoors if o.id == door), None)
+        if not d:
+            return   # (that door is open already)
+        if stuff.flags.get(id):
+            d.filled += 1; d.next += 1
+            return
+        hx, hy = X(x) + T / 2 - KEY_BOX / 2, Y(y) + T / 2 - KEY_BOX / 2
+        doorKeys.append(O(id=id, door=d, hx=hx, hy=hy, x=hx, y=hy, w=KEY_BOX, h=KEY_BOX, vx=0, vy=0, state='home', order=0,
+                          span=None, onGround=False))
+    t.key = key
+
+    # A cloud: a moving platform you can jump up through, w tiles wide, starting at tile (x, y).
+    # path: {'x': [from, to]} or {'y': [from, to]}, tiles from where it starts; speed in tiles
+    # per second (steady, turning around at each end).
+    def cloud(x, y, wTiles, path, speed):
+        x0, x1 = path.get('x', [0, 0])
+        y0, y1 = path.get('y', [0, 0])
+        movers.append(pathMover([[X(x + x0), Y(y + y0)], [X(x + x1), Y(y + y1)]], False, speed * T, math.hypot(x0, y0) * T, wTiles * T, 1))
+    t.cloud = cloud
+    # A cloud from the editor's Cloud tool (chunk field cl), see CLOUD_DEFAULTS.
+    t.editorCloud = lambda x, y, st: movers.append(makeCloud(X(x), Y(y), st))
+
+    # Extra settings for the editor cloud whose home is tile (x, y): waitRide, track,
+    # zones=[{x0, y0, x1, y1, pace}] (tiles, inclusive). Returns the cloud.
+    def tuneCloud(x, y, opts):
+        m = next((o for o in movers if o.hx == X(x) and o.hy == Y(y)), None)
+        if not m:
+            return None
+        for k, v in opts.items():
+            if k == 'zones':
+                m.zones = [O(x0=X(z['x0']), y0=Y(z['y0']), x1=X(z['x1'] + 1), y1=Y(z['y1'] + 1), pace=z['pace']) for z in v]
+            else:
+                m[k] = v
+        return m
+    t.tuneCloud = tuneCloud
+    # Tiles that are solid but never drawn.
+    t.barrier = lambda x, y, w, h: fill(x, y, w, h, 'I')
+    # A door (standing on row `floor`) that takes you to door `to` in this same area, with a
+    # quick fade. Nothing else changes, except that the clouds all start over.
+    t.localDoor = lambda x, floor, id, to: doors.append(O(x=X(x), y=Y(floor) - 2 * T, w=T, h=2 * T, id=id, here=to,
+                                                           lockedT=0, framed=True))
+    # A pad at tile (x, y): touch it and you're at teleporter `to` (also starts the clouds over).
+    t.teleporter = lambda x, y, id, to: teleporters.append(O(x=X(x), y=Y(y), w=T, h=T, id=id, to=to, armed=True))
+
+    # The giant chicken (see GIANT). trigger: tiles [x0, y0, x1, y1] (inclusive) that set it
+    # off; it appears with its front at column `front`, walks right on row `floor` (its feet)
+    # and can jump up to row `top`. slow: {x0, x1, time} = take `time` seconds for its front
+    # to get from column x0 to x1. It's gone (in a puff) when its front reaches column `stop`.
+    def giantChicken(o):
+        global giantSpec
+        tr, sl = o['trigger'], o.get('slow')
+        giantSpec = O(trigger=[X(tr[0]), Y(tr[1]), X(tr[2] + 1), Y(tr[3] + 1)],
+                      front=X(o['front']), floor=Y(o['floor']), top=Y(o['top']), stop=X(o['stop']),
+                      slow=O(x0=X(sl['x0']), x1=X(sl['x1']), speed=(sl['x1'] - sl['x0']) * T / sl['time']) if sl else None,
+                      done=False)
+    t.giantChicken = giantChicken
+
+    # A spiraling blue and purple portal over w x h tiles from (x, y). Up takes you to area
+    # `to`; until that area is built it's locked.
+    def swirlPortal(x, y, w, h, to, opts=None):
+        opts = opts or {}
+        doors.append(O(x=X(x), y=Y(y), w=w * T, h=(h + 1) * T, drawH=h * T, to=to, id=opts.get('id'),
+                       arrive=opts.get('arrive'), lockedT=0, swirl=True))
+    t.swirlPortal = swirlPortal
     return t
 
 
@@ -668,6 +784,8 @@ def chunkSection(hard, extra=None, easy=None):
             t.diamond(id, x, y)
         for x, y, st in chunk.fires or []:
             t.fire(x, y, st)
+        for x, y, st in chunk.clouds or []:
+            t.editorCloud(x, y, st)
         if extra:
             extra(t)
     return O(id=hard.name, name=hard.name, base=0, w=hard.w, h=hard.h, custom=True, chunk=hard, easy=easy, build=build)
@@ -792,7 +910,8 @@ def buildLevel():
     global LW, GH, grid, bgGrid, signs, checkpoints, treats, greenies, trees, texts, movers, lasers
     global chickens, houses, doors, npcs, props, diamonds, sectionSpans, switches, secrets, links, portals
     global activeSecret, views, camLikes, fireSpawners, fireballs, backdrop, dimness, turkeys, spawn, finish
-    global baseGrid, secretMap, endlessWalls, wingTreats, slabs
+    global baseGrid, secretMap, endlessWalls, wingTreats, slabs, spikeRooms, moverTime, lockDoors, doorKeys
+    global teleporters, giantSpec, giant
     order = AREAS.get(areaName) or []
     if TEST_CODE:
         try:
@@ -811,7 +930,8 @@ def buildLevel():
     chickens = []; houses = []; doors = []; npcs = []; props = []; diamonds = []; sectionSpans = []
     switches = []; secrets = []; links = []; portals = {}; activeSecret = 0; views = []; camLikes = []
     fireSpawners = []; fireballs = []
-    endlessWalls = []; wingTreats = []; slabs = []
+    endlessWalls = []; wingTreats = []; slabs = []; spikeRooms = []
+    moverTime = 0; lockDoors = []; doorKeys = []; teleporters = []; giantSpec = None; giant = None
     backdrop = 'sky'; dimness = 0; turkeys = []
     spawn = None; finish = None   # a world made only of chunks may have neither
     crumbleState.clear(); trampAnim.clear()
@@ -882,7 +1002,7 @@ def trunkPush(x, y, w, h, tr):
     return best
 
 
-SOLID_CHARS = set('#gX~T><wpklfo')
+SOLID_CHARS = set('#gX~T><wpklfoLI')
 
 
 def isSolidChar(c):
@@ -928,8 +1048,9 @@ def spikeTurn(tx, ty):
 
 
 # The part of a spike's tile that hurts: the points, on the side away from its ground.
-def spikeBox(tx, ty):
-    x, y, t = tx * T, ty * T, spikeTurn(tx, ty)
+def spikeBox(tx, ty, t=None):
+    x, y = tx * T, ty * T
+    t = spikeTurn(tx, ty) if t is None else t
     if t == math.pi:
         return (x + 4, y, T - 8, T - 14)
     if t == -math.pi / 2:
@@ -939,12 +1060,13 @@ def spikeBox(tx, ty):
     return (x + 4, y + 14, T - 8, T - 14)
 
 
-def rectHitsSolid(x, y, w, h):
+# grip: only walls Charlie can slide down / jump off (not invisible barriers)
+def rectHitsSolid(x, y, w, h, grip=False):
     x0, x1 = math.floor(x / T), math.floor((x + w - 0.001) / T)
     y0, y1 = math.floor(y / T), math.floor((y + h - 0.001) / T)
     for ty in range(y0, y1 + 1):
         for tx in range(x0, x1 + 1):
-            if wallAt(tx, ty):
+            if wallAt(tx, ty) and not (grip and tileAt(tx, ty) == 'I'):
                 return True
     return any(trunkPush(x, y, w, h, tr) for tr in trees)
 
@@ -1125,7 +1247,7 @@ def startWarp(to, arrive=None, spot=None, white=False):
 
 
 def respawn():
-    global grid, stamina, celebrate, inhale, slurps, thrown
+    global grid, stamina, celebrate, inhale, slurps, thrown, giant
     if lastCp and lastCp.area != areaName and areaExists(lastCp.area):
         # your checkpoint is in another area: back you go (that area is built fresh)
         frm = areaName
@@ -1136,6 +1258,12 @@ def respawn():
         P.eightPack = False; P.wings = False; stamina = 0
         return
     resetPlayer(respawnPoint)
+    resetMovers()
+    giant = None   # the giant chicken is gone until you pass its spot again
+    if giantSpec:
+        giantSpec.done = False
+    for tp in teleporters:
+        tp.armed = True
     celebrate = None
     # the world goes back the way it was built; collected greenies come back as ghosts
     grid = [r[:] for r in baseGrid]
@@ -1146,13 +1274,22 @@ def respawn():
     for w in wingTreats:
         w.t = 0; w.d = 0
     for sl in slabs:   # (the grid reset put it back up)
-        sl.update(p=0, row=0, moving=False, cells=None); sl.under.clear()
+        sl.update(p=0, moving=False, cells=None, turns=None)
+    for r in spikeRooms:
+        r.phase = None
+    for n in npcs:
+        if n.kind == 'bobTalk':
+            n.say = None
+            n.feet = n.home
+            for o in n.says:
+                o.done = False
     for g in greenies:
         g.taken = False
     stamina = 0
     crumbleState.clear()
     for ck in chickens:
         resetChicken(ck)
+    settleKeys()   # (keys stay where they were dropped)
     inhale = None; slurps = []; thrown = []
 
 
@@ -1193,7 +1330,7 @@ def updateSwitches():
 # your life (wings first: they burst into feathers; a turkey leg flies out of you).
 def hurt():
     global shake
-    if P.state == 'dead' or P.immune > 0:
+    if P.state == 'dead' or P.immune > 0 or devMode:
         return
     if not P.eightPack and not P.wings:
         return die()
@@ -1232,7 +1369,7 @@ def drawTurkeyImg(x, y, h, rot, alpha=1):
 
 def die():
     global deaths, shake
-    if P.state == 'dead':
+    if P.state == 'dead' or devMode:
         return
     P.eightPack = False; P.wings = False; P.immune = 0
     cx, cy = P.x + P.w / 2, P.y + P.h / 2
@@ -1240,6 +1377,7 @@ def die():
         a, s = random() * math.pi * 2, 120 + random() * 380
         spawnParticle(cx, cy, math.cos(a) * s, math.sin(a) * s - 150, 0.6 + random() * 0.5, 3 + random() * 3,
                       '#f4ece8' if i % 3 else '#e8a3a3', 900)
+    dropKeys()
     P.state = 'dead'; P.deadT = 0.7; P.vx = P.vy = 0
     deaths += 1; shake = 8
 
@@ -1276,14 +1414,14 @@ def setLow(low):
 
 def touchingWall(d):
     if d > 0:
-        return rectHitsSolid(P.x + P.w, P.y + 4, 1, P.h - 8)
-    return rectHitsSolid(P.x - 1, P.y + 4, 1, P.h - 8)
+        return rectHitsSolid(P.x + P.w, P.y + 4, 1, P.h - 8, True)
+    return rectHitsSolid(P.x - 1, P.y + 4, 1, P.h - 8, True)
 
 
 # Wall near enough to wall-jump off: -1 left, 1 right, 0 none.
 def wallContact():
-    l = rectHitsSolid(P.x - 4, P.y + 4, 4, P.h - 8)
-    r = rectHitsSolid(P.x + P.w, P.y + 4, 4, P.h - 8)
+    l = rectHitsSolid(P.x - 4, P.y + 4, 4, P.h - 8, True)
+    r = rectHitsSolid(P.x + P.w, P.y + 4, 4, P.h - 8, True)
     if l and r:
         return P.facing
     return -1 if l else 1 if r else 0
@@ -1329,6 +1467,8 @@ def wallJump(wd):
 
 
 def dive(d):
+    if P.wings:
+        return   # no dashing with wings
     d = d or P.facing
     P.facing = d
     dx = PHYS.diveX * pack(PHYS.packDiveX)
@@ -1481,6 +1621,33 @@ def breakBlock(tx, ty):
 # ---------------------------------------------------------------------
 #  Player update
 # ---------------------------------------------------------------------
+# Moving platforms and clouds go by moverTime, which starts over on a death or restart,
+# so they're always back where they started when Charlie comes back.
+def placeMovers(dt=0):
+    for m in movers:
+        if m.pts:   # a cloud: steady speed along its path (slower or faster in its zones)
+            if m.waitRide and not m.started and P.ride is m and P.onGround:
+                m.started = True
+            if not m.waitRide or m.started:
+                m.d += m.speed * cloudPace(m) * dt
+            nx, ny = cloudAt(m, m.d)
+        else:
+            k = 0.5 - 0.5 * math.cos(moverTime / m.period * math.pi * 2)
+            nx, ny = m.ax + (m.bx - m.ax) * k, m.ay + (m.by - m.ay) * k
+        m.dx = nx - m.x; m.dy = ny - m.y; m.x = nx; m.y = ny
+
+
+def resetMovers():
+    global moverTime
+    moverTime = 0
+    for m in movers:
+        if m.pts:
+            m.d = m.s0; m.started = False
+    placeMovers()
+    for m in movers:
+        m.dx = m.dy = 0
+
+
 def updatePlayer(dt):
     global warp
     if P.state == 'dead':
@@ -1488,10 +1655,14 @@ def updatePlayer(dt):
         if P.deadT <= 0:
             respawn()
         return
+    if devMode:
+        devFly(dt)
+        return
     dir = (1 if held('right') else 0) - (1 if held('left') else 0)
     D = held('down')
     if pressed('up') and P.onGround:
-        d = next((d for d in doors if overlap(P.x, P.y, P.w, P.h, d.x + 4, d.y, d.w - 8, d.h)), None)
+        # (wings don't fit through doors)
+        d = None if P.wings else next((d for d in doors if overlap(P.x, P.y, P.w, P.h, d.x + 4, d.y, d.w - 8, d.h)), None)
         if d:
             # a door to an area that isn't built yet just rattles
             if d.here:
@@ -2240,6 +2411,12 @@ def inhaleObjects():
             ck.held = True
             inhale.things.append(O(kind='chicken', ck=ck))
             slurps.append(O(ck=ck, x=cx, y=cy, t=0))
+    for f in fireballs:
+        if f.gone or not inCone(f.x, f.y) or rayBlocked(mx, my, f.x, f.y):
+            continue
+        f.gone = True
+        inhale.things.append(O(kind='fire', r=f.r))
+        slurps.append(O(fire=f.r, x=f.x, y=f.y, t=0))
 
 
 def updateInhale(dt):
@@ -2286,6 +2463,12 @@ def spitOne():
     if item.kind == 'tile':
         thrown.append(O(c=item.c, x=mx + sx * 18 - 14, y=my + sy * 18 - 14, w=28, h=28,
                         vx=sx * INHALE.spitSpeed, vy=sy * INHALE.spitSpeed, spin=0))
+    elif item.kind == 'fire':
+        # Charlie's own fireball: flies straight, can't burn him, does burn chickens
+        f = O(sp=None, spat=True, mode='straight', cx=mx + sx * 18, cy=my + sy * 18, age=0, r=item.r, life=0, ghost=False,
+              vx=sx * INHALE.spitSpeed, vy=sy * INHALE.spitSpeed)
+        f.x, f.y = firePos(f, 0)
+        fireballs.append(f)
     else:
         ck = item.ck
         ck.update(held=False, mode='flying', jumping=False, plan=None,
@@ -2376,8 +2559,9 @@ def fireSettings(s):
 
 
 # ---------------------------------------------------------------------
-#  Clouds (the editor's Cloud tool, chunk field cl = [[x, y, settings]]).
-#  The game doesn't build them yet; the editor draws and moves them.
+#  Clouds: platforms you jump up through that glide along a path at a
+#  steady speed. The editor's Cloud tool saves [x, y, settings] (x, y =
+#  the cloud's top-left tile when it's home).
 # ---------------------------------------------------------------------
 CLOUD_DEFAULTS = dict(
     w=4,            # tiles wide
@@ -2414,16 +2598,50 @@ def cloudTrip(s):
     return [[0, 0]], False
 
 
+# A cloud mover through pixel points pts. s0 = how far along it is at moverTime 0.
+# d: how far along it has gone. waitRide: stays put until Charlie stands on it (started).
+# zones: [{x0, y0, x1, y1, pace}] boxes (pixels) where its speed is multiplied by pace.
+# track: its path is drawn as a rail.
+def pathMover(pts, loop, speed, s0, w, scale):
+    n = len(pts) if loop else len(pts) - 1
+    ln = sum(math.hypot(pts[(i + 1) % len(pts)][0] - pts[i][0], pts[(i + 1) % len(pts)][1] - pts[i][1]) for i in range(n))
+    m = O(cloud=True, pts=pts, loop=loop, len=ln, speed=speed, s0=s0, d=s0, w=w, h=14, scale=scale, dx=0, dy=0,
+          waitRide=False, started=False, zones=[], track=False, hx=None, hy=None)
+    m.x, m.y = cloudAt(m, m.d)
+    return m
+
+
 def makeCloud(x, y, st):   # x, y: home top-left in pixels
     s = cloudSettings(st)
     pts, loop = cloudTrip(s)
-    pts = [[x + px * T, y + py * T] for px, py in pts]
-    n = len(pts) if loop else len(pts) - 1
-    ln = sum(math.hypot(pts[(i + 1) % len(pts)][0] - pts[i][0], pts[(i + 1) % len(pts)][1] - pts[i][1]) for i in range(n))
-    m = O(pts=pts, loop=loop, len=ln, speed=s.speed * T, w=s.w * T, scale=s.scale, hx=x, hy=y)
-    m.s0 = s.start / 100 * (ln if loop else 2 * ln)
-    m.x, m.y = cloudAt(m, m.s0)
+    m = pathMover([[x + px * T, y + py * T] for px, py in pts], loop, s.speed * T, 0, s.w * T, s.scale)
+    m.s0 = m.d = s.start / 100 * (m.len if loop else 2 * m.len)
+    m.hx, m.hy = x, y
+    m.x, m.y = cloudAt(m, m.d)
     return m
+
+
+# How fast a cloud goes where it is now (1 = its normal speed), from its middle.
+def cloudPace(m, x=None, y=None):
+    x = m.x if x is None else x
+    y = m.y if y is None else y
+    cx, cy, k = x + m.w / 2, y + T / 2, 1
+    for z in m.zones:
+        if z.x0 <= cx < z.x1 and z.y0 <= cy < z.y1:
+            k *= z.pace
+    return k
+
+
+# Seconds for a looping cloud to go once round (speed zones included).
+def cloudLapTime(m):
+    if not m.len:
+        return 0
+    step, trip = 1 / 240, m.len if m.loop else 2 * m.len
+    d = t = 0
+    while d < trip and t < 600:
+        x, y = cloudAt(m, m.s0 + d)
+        d += m.speed * cloudPace(m, x, y) * step; t += step
+    return t
 
 
 # Where a cloud is once it has gone d pixels: round and round a loop, or there and back.
@@ -2509,6 +2727,8 @@ def updateFire(dt, preview=False):
             fireballs.append(sp.next); sp.alive += 1; sp.next = rollFire(sp)
         sp.t += max(0.05, pick(sp.s.every))
     for f in fireballs:
+        if f.gone:
+            continue   # inhaled
         f.age += dt
         f.x, f.y = firePos(f, f.age)
         if random() < 0.3:
@@ -2523,13 +2743,15 @@ def updateFire(dt, preview=False):
             continue
         # touching Charlie (closest point of his box within the flame) burns him
         nx, ny = max(P.x, min(P.x + P.w, f.x)), max(P.y, min(P.y + P.h, f.y))
-        if P.state != 'dead' and math.hypot(f.x - nx, f.y - ny) < f.r * 0.8:
-            hurt()
+        if not f.spat:
+            if P.state != 'dead' and math.hypot(f.x - nx, f.y - ny) < f.r * 0.8:
+                hurt()
+            continue
         for ck in chickens:
             if ck.alive and not ck.held and overlap(f.x - f.r, f.y - f.r, f.r * 2, f.r * 2, ck.x, ck.y, ck.w, ck.h):
                 killChicken(ck)
     for f in fireballs:
-        if f.gone:
+        if f.gone and f.sp:
             f.sp.alive -= 1
     fireballs = [f for f in fireballs if not f.gone]
 
@@ -2598,10 +2820,13 @@ def drawFireWarnings():
 # Flat circles: orange, yellow, then a white-hot middle, with a little flicker.
 def drawFireballs():
     for f in fireballs:
-        k = 1 + math.sin(simTime * 30 + f.age * 7) * 0.08
-        ctx.fillStyle = '#ff7a1a'; ctx.beginPath(); ctx.arc(f.x, f.y, f.r * k, 0, math.pi * 2); ctx.fill()
-        ctx.fillStyle = '#ffd23f'; ctx.beginPath(); ctx.arc(f.x, f.y, f.r * 0.62, 0, math.pi * 2); ctx.fill()
-        ctx.fillStyle = '#fff6d0'; ctx.beginPath(); ctx.arc(f.x, f.y, f.r * 0.28, 0, math.pi * 2); ctx.fill()
+        drawFireball(f.x, f.y, f.r, 1 + math.sin(simTime * 30 + f.age * 7) * 0.08)
+
+
+def drawFireball(x, y, r, k):
+    ctx.fillStyle = '#ff7a1a'; ctx.beginPath(); ctx.arc(x, y, r * k, 0, math.pi * 2); ctx.fill()
+    ctx.fillStyle = '#ffd23f'; ctx.beginPath(); ctx.arc(x, y, r * 0.62, 0, math.pi * 2); ctx.fill()
+    ctx.fillStyle = '#fff6d0'; ctx.beginPath(); ctx.arc(x, y, r * 0.28, 0, math.pi * 2); ctx.fill()
 
 
 # ---------------------------------------------------------------------
@@ -2652,7 +2877,7 @@ def updateParticles(dt):
 
 
 def update(dt):
-    global toast, celebrate, warp, easyScene, simTime, runTime, camX, camY, shake
+    global toast, celebrate, warp, easyScene, simTime, runTime, camX, camY, shake, moverTime
     if toast:
         toast.t -= dt
         if toast.t <= 0:
@@ -2698,10 +2923,8 @@ def update(dt):
     if not finished:
         runTime += dt
 
-    for m in movers:
-        k = 0.5 - 0.5 * math.cos(simTime / m.period * math.pi * 2)
-        nx, ny = m.ax + (m.bx - m.ax) * k, m.ay + (m.by - m.ay) * k
-        m.dx = nx - m.x; m.dy = ny - m.y; m.x = nx; m.y = ny
+    moverTime += dt
+    placeMovers(dt)
 
     for key, s in list(crumbleState.items()):
         s.t -= dt
@@ -2726,9 +2949,13 @@ def update(dt):
 
     updatePlayer(dt)
     updateSlabs(dt)
+    updateSpikeRooms(dt)
     updateWingTreats(dt)
     updateLinks()
     updateSwitches()
+    updateKeys(dt)
+    updateTeleporters()
+    updateGiant(dt)
     updateInhale(dt)
     updateChickens(dt)
     updateThrown(dt)
@@ -2765,7 +2992,7 @@ COL = O(
 
 screen = None
 ctx = None
-charlieImg = greenieImg = chickenImg = hatImg = mapImg = bobImg = bobTalkImg = grandmaImg = turkeyImg = charlieStrongImg = None
+charlieImg = greenieImg = chickenImg = hatImg = mapImg = bobImg = bobTalkImg = grandmaImg = turkeyImg = charlieStrongImg = blasterTopImg = blasterBottomImg = None
 greenieBackImg = None
 
 
@@ -2813,24 +3040,31 @@ def drawWorld(sx, sy):
     drawCheckpoints()
     drawFinish()
     drawLasers()
+    drawTracks()
     drawTiles(x0, x1, y0, y1)
     drawSlabs()
+    drawLockDoors()
     drawProps()
     drawTrees()
     drawTexts()
+    drawBobTalk()
     drawMovers()
+    drawTeleporters()
     drawTreats()
     drawWingTreats()
     drawGreenies()
     drawDiamonds()
     drawNpcs()
     drawChickens()
+    drawGiant()
     drawThrown()
     drawFireballs()
     drawInhaleCone()
     drawSlurps()
+    drawKeys()
     drawSwitches()
     drawSecrets()
+    drawSpikeRooms()
 
 
 # What's past a linked doorway, drawn in place on the screen (see `views`).
@@ -2866,15 +3100,19 @@ def draw():
     sx, sy = (random() - 0.5) * shake, (random() - 0.5) * shake
     if P.state != 'dead':
         activeSecret = secretAt(math.floor((P.x + P.w / 2) / T), math.floor((P.y + P.h / 2) / T))
+    for z in secrets:
+        if z.showFrom:
+            x0, y0, x1, y1 = z.showFrom
+            z.showing = x0 <= P.x + P.w / 2 < x1 and y0 <= P.y + P.h / 2 < y1
     drawWorld(sx, sy)
     drawViews(sx, sy)
     ctx.setTransform()
     ctx.translate(-round(camX + sx), -round(camY + sy))
+    drawEndlessWalls()
     if celebrate:
         drawCelebrationBackdrop()
     drawPlayer()
     drawParticles()
-    drawEndlessWalls(sx, sy)
     drawDim()
     drawNpcTalk()
     drawPopups()
@@ -2889,7 +3127,6 @@ def draw():
     else:
         if not ui and not warp:
             drawFireWarnings()
-            drawFarTalk()
         if ui:
             drawUI()
         drawHUD()
@@ -2930,7 +3167,7 @@ def coveredAt(tx, ty):
         return False
     id = secretAt(tx, ty)
     if not activeSecret:
-        return id > 0
+        return id > 0 and not secrets[id - 1].showing
     z = secrets[activeSecret - 1]
     if z.keepOutside and not id:
         return False
@@ -2970,13 +3207,24 @@ CRACKS = [
 
 
 def drawTiles(x0, x1, y0, y1):
-    falling = any(sl.moving for sl in slabs)   # (a falling ceiling is drawn smoothly by drawSlabs)
     for ty in range(y0, y1 + 1):
         row = grid[ty]
         for tx in range(x0, x1 + 1):
             c = row[tx]
-            if c != '.' and c != 'c' and not (falling and slabAt(tx, ty)):
+            if c != '.' and c != 'c':
                 drawTile(c, tx * T, ty * T, tx, ty)
+
+
+# A spike centred at (x, y), turned by `turn` (0 = pointing up).
+def drawSpike(x, y, turn, col=None):
+    ctx.save()
+    ctx.translate(x, y); ctx.rotate(turn)
+    ctx.fillStyle = col or COL.spike
+    ctx.beginPath()
+    ctx.moveTo(-16, 16); ctx.lineTo(-8, -6); ctx.lineTo(0, 16)
+    ctx.lineTo(8, -6); ctx.lineTo(16, 16)
+    ctx.closePath(); ctx.fill()
+    ctx.restore()
 
 
 # One tile at (px, py). A loose tile (flying through the air) has no tx, ty and
@@ -3095,19 +3343,14 @@ def drawTile(c, px, py, tx=None, ty=None):
                 ctx.fillRect(px, py, 7, T)
     elif c == '^':
         # turned to stick to the ground beside it (a loose one in the air stays upright)
-        turn = 0 if loose else spikeTurn(tx, ty)
-        ctx.save()
-        ctx.translate(px + T / 2, py + T / 2); ctx.rotate(turn)
-        ctx.fillStyle = COL.spike
-        ctx.beginPath()
-        ctx.moveTo(-16, 16); ctx.lineTo(-8, -6); ctx.lineTo(0, 16)
-        ctx.lineTo(8, -6); ctx.lineTo(16, 16)
-        ctx.closePath(); ctx.fill()
-        ctx.restore()
+        drawSpike(px + T / 2, py + T / 2, 0 if loose else spikeTurn(tx, ty))
 
 
 def drawMovers():
     for m in movers:
+        if m.cloud:
+            drawCloud(m.x, m.y, m.w, m.scale)
+            continue
         ctx.fillStyle = 'rgba(94,129,172,0.15)'
         ctx.fillRect(min(m.ax, m.bx), min(m.ay, m.by), abs(m.bx - m.ax) + m.w, abs(m.by - m.ay) + m.h)
         ctx.fillStyle = COL.mover; ctx.fillRect(m.x, m.y, m.w, m.h)
@@ -3325,16 +3568,28 @@ def drawHouses():
         if d.x > camX + VIEW_W or d.x + d.w < camX:
             continue
         jig = math.sin(simTime * 70) * 2 if d.lockedT > 1 else 0   # rattles when locked
+        if d.swirl:
+            ctx.save(); ctx.translate(jig, 0); drawSwirl(d); ctx.restore()
+            near = P.state != 'dead' and not P.wings and overlap(P.x, P.y, P.w, P.h, d.x + 4, d.y, d.w - 8, d.h)
+            if d.lockedT > 0:
+                ctx.globalAlpha = min(1, d.lockedT * 2)
+                msg = 'LOCKED'
+                sz = pixelTextSize(msg)
+                drawPixelText(msg, d.x + d.w / 2 - sz.w / 2, d.y - 40, '#2b2f36')
+                ctx.globalAlpha = 1
+            elif near:
+                drawUpArrow(d.x + d.w / 2, d.y - 18)
+            continue
         if d.hole:
             drawHole(d)
-            if P.state != 'dead' and overlap(P.x, P.y, P.w, P.h, d.x + 4, d.y, d.w - 8, d.h):
+            if P.state != 'dead' and not P.wings and overlap(P.x, P.y, P.w, P.h, d.x + 4, d.y, d.w - 8, d.h):
                 drawUpArrow(d.x + d.w / 2, d.y - 18)
             continue
         if d.framed:
             ctx.fillStyle = '#7a5232'; ctx.fillRect(d.x - 3, d.y - 2, d.w + 6, d.h + 2)
         ctx.fillStyle = '#8d5a3b'; ctx.fillRect(d.x + 3 + jig, d.y + 4, d.w - 6, d.h - 4)
         ctx.fillStyle = '#f1c40f'; ctx.beginPath(); ctx.arc(d.x + d.w - 9 + jig, d.y + d.h * 0.55, 3, 0, math.pi * 2); ctx.fill()
-        near = P.state != 'dead' and overlap(P.x, P.y, P.w, P.h, d.x + 4, d.y, d.w - 8, d.h)
+        near = P.state != 'dead' and not P.wings and overlap(P.x, P.y, P.w, P.h, d.x + 4, d.y, d.w - 8, d.h)
         if d.lockedT > 0:
             ctx.globalAlpha = min(1, d.lockedT * 2)
             msg = 'COMING SOON'
@@ -3389,7 +3644,8 @@ def drawNpcs():
 def drawCheckpoints():
     for cp in checkpoints:
         ctx.fillStyle = '#555'; ctx.fillRect(cp.x - 2, cp.y - 64, 4, 64)
-        ctx.fillStyle = '#27ae60' if cp.active else '#aab2bd'
+        # (dev mode ones are purple)
+        ctx.fillStyle = ('#9b59ff' if cp.active else '#c9b3f0') if cp.dev else '#27ae60' if cp.active else '#aab2bd'
         wave = math.sin(simTime * 6) * (3 if cp.active else 1)
         ctx.beginPath()
         ctx.moveTo(cp.x + 2, cp.y - 64); ctx.lineTo(cp.x + 26, cp.y - 56 + wave); ctx.lineTo(cp.x + 2, cp.y - 46)
@@ -3440,6 +3696,8 @@ def drawSigns():
 
 def drawParticles():
     for p in particles:
+        if endlessWalls and behindEndlessWall(p.x, p.y):
+            continue
         ctx.globalAlpha = max(0, p.life / p.max)
         ctx.fillStyle = p.color
         ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size)
@@ -3520,12 +3778,13 @@ def drawPlayer():
     ctx.restore()
 
     if celebrate:
-        drawGreenieIcon(cx, P.y - hop - 34, 1.5, celebrate.t * 5, 1)
+        drawGreenieIcon(cx, P.y - hop - 34, 1.5, celebrate.t * 5, 1, greenieImgFor(celebrate.g.id))
 
 
 # The bag, spinning on its vertical axis like a Power Moon.
-def drawGreenieIcon(x, y, scale, spin, alpha):
-    if not greenieImg.naturalWidth:
+def drawGreenieIcon(x, y, scale, spin, alpha, img=None):
+    img = img or greenieImg
+    if not img.naturalWidth:
         return
     w, h = 30 * scale, 37 * scale
     c = math.cos(spin)
@@ -3533,9 +3792,29 @@ def drawGreenieIcon(x, y, scale, spin, alpha):
     ctx.globalAlpha = alpha
     ctx.translate(x, y)
     ctx.scale(max(0.08, abs(c)), 1)
-    # the back of the bag is a bit darker
-    ctx.drawImage(greenieBackImg if c < 0 else greenieImg, -w / 2, -h / 2, w, h)
+    # the back of the normal bag is a bit darker (challenge greenies look the same both ways)
+    ctx.drawImage(greenieBackImg if c < 0 and img is greenieImg else img, -w / 2, -h / 2, w, h)
     ctx.restore()
+
+
+# Challenge greenies: the hardest ones, each with its own picture, listed on the
+# Achievements screen. world.py adds them with addChallenge(id, name, img) (img = a key of
+# challengeImgs, loaded in loadImages).
+CHALLENGES = []
+challengeImgs = {}
+
+
+def addChallenge(id, name, img):
+    CHALLENGES.append(O(id=id, name=name, img=img))
+
+
+def challengeOf(id):
+    return next((c for c in CHALLENGES if c.id == id), None)
+
+
+def greenieImgFor(id):
+    c = challengeOf(id)
+    return challengeImgs.get(c.img) if c and challengeImgs.get(c.img) else greenieImg
 
 
 def drawGreenies():
@@ -3546,11 +3825,13 @@ def drawGreenies():
             continue
         ghost = g.id in greeniesGot   # already collected on an earlier play
         bob = math.sin(simTime * 2.5 + g.x) * 4
+        ch = bool(challengeOf(g.id))   # challenge greenies glow sky blue
         if not ghost:
-            ctx.fillRadial(g.x, g.y + bob, 4, 40, [(0, 'rgba(201,242,122,0.7)'), (1, 'rgba(201,242,122,0)')])
+            glow = (160, 215, 255, 0.8) if ch else (201, 242, 122, 0.7)
+            ctx.fillRadial(g.x, g.y + bob, 4, 40, [(0, 'rgba(%d,%d,%d,%s)' % glow), (1, 'rgba(%d,%d,%d,0)' % glow[:3])])
             if random() < 0.06:
-                spawnParticle(g.x + (random() - 0.5) * 34, g.y + (random() - 0.5) * 40, 0, -30, 0.6, 3, '#fff6a8', 0)
-        drawGreenieIcon(g.x, g.y + bob, 1, simTime * 2.2 + g.x, 0.35 if ghost else 1)
+                spawnParticle(g.x + (random() - 0.5) * 34, g.y + (random() - 0.5) * 40, 0, -30, 0.6, 3, '#e4f4ff' if ch else '#fff6a8', 0)
+        drawGreenieIcon(g.x, g.y + bob, 1, simTime * 2.2 + g.x, 0.35 if ghost else 1, greenieImgFor(g.id))
 
 
 # --- chickens: one photo, wobbling side to side as they waddle -----------
@@ -3631,6 +3912,8 @@ def drawSlurps():
             drawTile(s.c, -T / 2, -T / 2)
         elif s.ck:
             drawChickenAt(0, CK_DRAW_H / 2, s.ck.facing, 0)
+        elif s.fire:
+            drawFireball(0, 0, s.fire, 1)
         else:
             drawSweetPotato(0, 0, 0)
         ctx.restore()
@@ -3669,8 +3952,9 @@ def drawCelebrationBanner():
     ctx.scale(pop, pop)
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
     ctx.font = font(900, 46)
-    ctx.lineWidth = 8; ctx.strokeStyle = '#1f4d12'; ctx.strokeText('You got a Greenie!', 0, 0)
-    ctx.fillStyle = '#c9f27a'; ctx.fillText('You got a Greenie!', 0, 0)
+    head = 'Challenge Greenie!' if challengeOf(celebrate.g.id) else 'You got a Greenie!'
+    ctx.lineWidth = 8; ctx.strokeStyle = '#1f4d12'; ctx.strokeText(head, 0, 0)
+    ctx.fillStyle = '#c9f27a'; ctx.fillText(head, 0, 0)
     ctx.font = font(700, 20)
     ctx.lineWidth = 5; ctx.strokeStyle = '#1b1e23'; ctx.strokeText(celebrate.g.name, 0, 44)
     ctx.fillStyle = '#fff'; ctx.fillText(celebrate.g.name, 0, 44)
@@ -3781,6 +4065,18 @@ def drawHUD():
     saveShown = not TEST_CODE and not ui
     if saveShown:
         drawSaveButton()
+    if debugMode and not devMode:
+        ctx.font = font(700, 14); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'
+        ctx.fillStyle = 'rgba(214,48,49,0.85)'
+        ctx.beginPath(); ctx.roundRect(VIEW_W - 272, VIEW_H - 50, 260, 32, 8); ctx.fill()
+        ctx.fillStyle = '#fff'; ctx.fillText('DEBUG MODE  ·  V = dev mode', VIEW_W - 24, VIEW_H - 33)
+    if devMode:
+        ctx.font = font(700, 16); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+        msg = 'Click for checkpoint'
+        mw = ctx.measureText(msg) + 28
+        ctx.fillStyle = 'rgba(214,48,49,0.85)'
+        ctx.beginPath(); ctx.roundRect(VIEW_W / 2 - mw / 2, VIEW_H - 54, mw, 36, 8); ctx.fill()
+        ctx.fillStyle = '#fff'; ctx.fillText(msg, VIEW_W / 2, VIEW_H - 35)
     if showTimer:
         m = math.floor(runTime / 60)
         sec = ('%.2f' % (runTime % 60)).rjust(5, '0')
@@ -3799,7 +4095,7 @@ def drawHUD():
 # ---------------------------------------------------------------------
 def loadImages():
     global charlieImg, greenieImg, chickenImg, hatImg, mapImg, bobImg, bobTalkImg, grandmaImg, turkeyImg, charlieStrongImg
-    global greenieBackImg
+    global greenieBackImg, blasterTopImg, blasterBottomImg
     charlieImg = Img('images/charlie.png')
     greenieImg = Img('images/greenie.png')
     chickenImg = Img('images/chicken.png')
@@ -3810,6 +4106,10 @@ def loadImages():
     grandmaImg = Img('images/grandma.png')
     turkeyImg = Img('images/turkeyleg.png')
     charlieStrongImg = Img('images/charlie-stong.png')
+    blasterTopImg = Img('images/bobblastertop.png')
+    blasterBottomImg = Img('images/bobblasterbottom.png')
+    challengeImgs.clear()
+    challengeImgs['cloudGreenie'] = Img('images/cloud_greenie.png')
     # the greenie's back: the same bag, a bit darker and greener
     greenieBackImg = Img('images/greenie.png')
     if greenieBackImg.surf:
@@ -4183,6 +4483,9 @@ def mapInChest():
 
 # --- mouse --------------------------------------------------------------------
 def uiDown(x, y):
+    if ui.kind in ('pause', 'trophies'):
+        pauseClick(x, y)
+        return
     if ui.zoom:
         ui.zoom = None
         return
@@ -4277,6 +4580,10 @@ def drawUI():
         drawClosetScreen()
     elif ui.kind == 'save':
         pass
+    elif ui.kind == 'pause':
+        drawPause()
+    elif ui.kind == 'trophies':
+        drawTrophies()
     else:
         if ui.kind == 'chest':
             drawChestScreen()
@@ -4460,6 +4767,7 @@ def makeSaveCode():
         'g': list(greeniesGot), 'h': stuff.hat, 'i': stuff.inv, 'd': stuff.diamonds,
         'n': stuff.gameName, 'r': stuff.realName, 'b': stuff.bobGone, 'f': stuff.flags, 'gm': stuff.grandmaDone,
         'st': stamina, 'ep': bool(P.eightPack), 'wg': bool(P.wings), 'df': difficulty,
+        **({'dv': True} if debugMode else {}),   # made in debug mode: loading it turns debug mode on
         # where you are: the area, where Charlie stands, and the checkpoint you'd respawn at
         'l': {'a': areaName, 'at': spotOf(P.x + P.w / 2, P.y + P.h),
               'cp': lastCp.spot if lastCp else spotOf(respawnPoint.x, respawnPoint.y),
@@ -4482,6 +4790,8 @@ def loadSaveCode(code):
                  grandmaDone=bool(d.get('gm')))
     saveStuff()
     difficulty = 'easy' if d.get('df') == 'easy' else 'hard'   # (codes from before Easy existed are Hard)
+    if d.get('dv'):
+        turnOnDebug()
     return d
 
 
@@ -4494,6 +4804,15 @@ def freshStart():
 # --- boxes you type into or click, drawn over the game (the browser's HTML layer) ----------------
 saveBox = O(visible=False, text='', focus=False, x=VIEW_W / 2 - 220, y=424, w=440, h=36,
             placeholder='Paste a save code here (leave it empty to start fresh)')
+# the dev mode box (top right of the start menu): the right word turns debug mode on for good
+devBox = O(visible=False, text='', focus=False, x=VIEW_W - 192, y=14, w=180, h=32, placeholder='Dev mode')
+
+
+# The save box and dev mode box only show on the start menu.
+def showMenuBoxes(on):
+    saveBox.visible = devBox.visible = on
+    if not on:
+        saveBox.focus = devBox.focus = False
 panel = None   # O(kind='ask' | 'diff' | 'save', ...)
 
 
@@ -4612,6 +4931,13 @@ def drawOverlay():
     ctx.setTransform()
     if saveBox.visible:
         _input(saveBox.x, saveBox.y, saveBox.w, saveBox.h, saveBox.text, saveBox.focus, saveBox.placeholder)
+    if devBox.visible:
+        if debugMode:
+            _input(devBox.x, devBox.y, devBox.w, devBox.h, 'Dev mode on', False, colr='#ff8a80')
+            ctx.strokeStyle = '#d63031'; ctx.lineWidth = 2
+            ctx.beginPath(); ctx.roundRect(devBox.x, devBox.y, devBox.w, devBox.h, 8); ctx.stroke()
+        else:
+            _input(devBox.x, devBox.y, devBox.w, devBox.h, devBox.text, devBox.focus, devBox.placeholder)
     if not panel:
         return
     box, parts = panelLayout()
@@ -4673,6 +4999,11 @@ def overlayClick(x, y):
                 return True
         if overlap(x, y, 1, 1, *box):
             return True
+    if devBox.visible:
+        devBox.focus = not debugMode and overlap(x, y, 1, 1, devBox.x, devBox.y, devBox.w, devBox.h)
+        if devBox.focus:
+            saveBox.focus = False
+            return True
     if saveBox.visible:
         saveBox.focus = overlap(x, y, 1, 1, saveBox.x, saveBox.y, saveBox.w, saveBox.h)
         if saveBox.focus:
@@ -4695,6 +5026,12 @@ def overlayKey(e):
     target = None
     if panel and panel.kind == 'ask':
         target = 'ask'
+    elif devBox.visible and devBox.focus:
+        if e.key == pygame.K_BACKSPACE:
+            devBox.text = devBox.text[:-1]
+        elif e.key == pygame.K_ESCAPE:
+            devBox.focus = False
+        return True
     elif saveBox.visible and saveBox.focus:
         target = 'save'
     if not target:
@@ -4723,6 +5060,11 @@ def overlayKey(e):
 def overlayText(s):
     if panel and panel.kind == 'ask':
         panel.text = (panel.text + s)[:30]
+        return True
+    if devBox.visible and devBox.focus:
+        devBox.text += s
+        if devBox.text.strip().lower() == DEBUG_WORD:
+            turnOnDebug()
         return True
     if saveBox.visible and saveBox.focus:
         saveBox.text += s
@@ -4866,11 +5208,6 @@ BOB_WRAP = 22   # letters per line
 
 def drawNpcTalk():
     for n in npcs:
-        if n.kind == 'bobTalk':
-            b = bobTalkBox(n)
-            if b and b.inView:
-                drawPixelText(b.text, b.x, b.y, '#000000')
-            continue
         if not npcTalking(n):
             continue
         lines = wrapWords(npcLine(n), BOB_WRAP)
@@ -4905,7 +5242,8 @@ def openMenu(code=''):
     # the tutorial's warp greenie collected? then PLAY is picked to start with
     done = any(id in greeniesGot for id in GREENIE_WARPS)
     menu = O(sel=1 if done else 0, error='', asking=False)
-    saveBox.text = code; saveBox.visible = True; saveBox.focus = False
+    saveBox.text = code
+    showMenuBoxes(True)
 
 
 def chooseMenu(i):
@@ -4924,7 +5262,7 @@ def chooseMenu(i):
     # Easy first has Bob try to talk you out of it.
     freshStart()
     menu.asking = True
-    saveBox.visible = False
+    showMenuBoxes(False)
 
     def named(realName):
         stuff.realName = realName; saveStuff()
@@ -4959,7 +5297,7 @@ def continueSave():
         startGame(menu.sel)   # an old code without a place
         return
     menu = None
-    saveBox.visible = False; saveBox.focus = False
+    showMenuBoxes(False)
     deaths = 0; runTime = 0; finished = False; lastCp = None; areaGrids = {}
     stamina = d.get('st') or 0
     startWarp(loc['a'], None, loc)
@@ -4969,7 +5307,7 @@ def continueSave():
 def startGame(i, white=False):
     global menu, stamina, deaths, runTime, finished, lastCp, areaGrids
     menu = None
-    saveBox.visible = False; saveBox.focus = False
+    showMenuBoxes(False)
     stamina = 0; deaths = 0; runTime = 0; finished = False; P.eightPack = False; lastCp = None; areaGrids = {}
     startWarp(MENU_ITEMS[i].to, None, None, white)
 
@@ -5098,7 +5436,7 @@ def keyCode(e):
 
 
 def onKeyDown(e):
-    global debug, showTimer, enterStreak, lastEnter
+    global debug, showTimer, enterStreak, lastEnter, devMode
     if overlayKey(e):
         if e.key == pygame.K_ESCAPE and ui:
             closeUI()
@@ -5110,6 +5448,9 @@ def onKeyDown(e):
     if warp:
         return
     if ui:
+        if ui.kind in ('pause', 'trophies'):
+            pauseKey(code)
+            return
         if code in ('Escape', 'KeyE'):
             if ui.zoom:
                 ui.zoom = None
@@ -5119,8 +5460,11 @@ def onKeyDown(e):
     if code == 'KeyE':
         openUI('inventory')
         return
-    if code == 'Escape' and not TEST_CODE and areaExists('Tutorial'):
-        keys.clear(); openMenu(makeSaveCode())
+    if code == 'Escape' and not TEST_CODE:
+        openPause()
+        return
+    if code in ('Digit1', 'Numpad1'):
+        openTrophies(False)
         return
     if code == 'KeyR':
         if P.state != 'dead':
@@ -5139,6 +5483,12 @@ def onKeyDown(e):
         return
     if code == 'KeyT':
         showTimer = not showTimer
+        return
+    if code == 'KeyV' and devAllowed():
+        devMode = not devMode
+        P.vx = P.vy = 0; P.immune = 0
+        if P.state == 'dead':
+            respawn()
         return
     keys.add(code); pressedKeys.add(code)
 
@@ -5161,6 +5511,11 @@ def onMouseDown(x, y, button):
         return
     if not TEST_CODE and not warp and overlap(x, y, 1, 1, SAVE_BTN.x, SAVE_BTN.y, SAVE_BTN.w, SAVE_BTN.h):
         openSave()
+        return
+    if button == 1 and not warp and clickBobTalk(x + camX, y + camY):
+        return
+    if devMode and button == 1 and not warp:
+        placeDevCheckpoint(x + camX, y + camY)
         return
     if clickNpcs():
         return
@@ -5231,22 +5586,9 @@ def boot():
         clock.tick(60)
 
 
-# --- Bob who talks when things happen (t.talkingBob). Each line comes out a word at a time
-# (*slow* words much slower), stays a few seconds, then he goes quiet. When he's off screen,
-# his words show at the edge of the screen instead, so you still hear him.
-SLOW_WORD = 0.8   # seconds for each *slow* word
-SAY_HOLD = 4      # seconds a line stays once it's all out
-
-
-def lineWords(line):
-    import re
-    out, t = [], 0
-    for w in line.replace('{name}', playerName()).split(' '):
-        out.append(O(w=w.replace('*', ''), at=t))
-        t += SLOW_WORD if re.match(r'^\*.+\*\W*$', w) else WORD_TIME
-    return out
-
-
+# --- Bob who talks when things happen (t.talkingBob). What he says is ordinary writing in the
+# world above his head, coming out a word at a time. Something new happening changes it, and
+# clicking it takes it away.
 def updateBobTalk(n, dt):
     if n.say:
         n.say.t += dt
@@ -5265,57 +5607,297 @@ def updateBobTalk(n, dt):
         elif o.at:
             now = tiles(o.at[0], o.at[1]) <= o.at[2]
         elif o.secret:
-            now = id > 0 and secrets[id - 1].name == o.secret
+            now = id > 0 and secrets[id - 1].name in o.secret
         else:
             now = False
         if not now:
             continue
         o.done = True
-        n.say = O(words=lineWords(o.line), t=0)   # (a newer line cuts in)
+        n.say = O(text=o.line.replace('{name}', playerName()), t=0)
+        if o.start:
+            startSpikeRoom(o.start, o.delay)
 
 
-def sayShown(say):
-    return sum(1 for w in say.words if w.at <= say.t)
+def bobWordsOut(n):
+    return min(len(n.say.text.split(' ')), math.floor(n.say.t / WORD_TIME) + 1)
 
 
 def bobTalkMouth(n):
-    return bool(n.say) and sayShown(n.say) < len(n.say.words) and sayShown(n.say) % 2 == 1
+    return bool(n.say) and bobWordsOut(n) < len(n.say.text.split(' ')) and bobWordsOut(n) % 2 == 1
 
 
-# Where his words go above his head (world pixels), the words out so far, and whether it's on screen.
+# Where his words are, in world pixels, and the ones out so far (None when he has nothing to say).
 def bobTalkBox(n):
-    say = n.say
-    if not say or say.t > say.words[-1].at + SAY_HOLD:
+    if not n.say:
         return None
-    lines = wrapWords(' '.join(w.w for w in say.words), BOB_WRAP)
-    left, shown = sayShown(say), []
+    lines = wrapWords(n.say.text, BOB_WRAP)
+    sz = pixelTextSize('\n'.join(lines))
+    left, shown = bobWordsOut(n), []
     for l in lines:
         w = l.split(' ')
         shown.append(' '.join(w[:max(0, left)])); left -= len(w)
-    sz = pixelTextSize('\n'.join(lines))
-    x, y = n.x - sz.w / 2, n.feet - 36 - 20 - sz.h
-    inView = x >= camX and x + sz.w <= camX + VIEW_W and y >= camY and y + sz.h <= camY + VIEW_H
-    return O(text='\n'.join(shown), x=x, y=y, w=sz.w, h=sz.h, inView=inView)
+    return O(text='\n'.join(shown), x=n.x - sz.w / 2, y=n.feet - 36 - 20 - sz.h, w=sz.w, h=sz.h)
 
 
-# (screen space) Bob's words at the screen edge nearest him while he's out of sight.
-def drawFarTalk():
+def drawBobTalk():
     for n in npcs:
-        if n.kind != 'bobTalk':
+        b = bobTalkBox(n) if n.kind == 'bobTalk' else None
+        if b:
+            drawPixelText(b.text, b.x, b.y, '#000000')
+
+
+# A click on his words (world pixels) takes them away. Returns True if it hit them.
+def clickBobTalk(wx, wy):
+    for n in npcs:
+        b = bobTalkBox(n) if n.kind == 'bobTalk' else None
+        if b and overlap(wx, wy, 1, 1, b.x - 4, b.y - 4, b.w + 8, b.h + 8):
+            n.say = None
+            return True
+    return False
+
+
+# --- rooms that fill with spikes (t.spikeRoom). Some time after it's set off the room shuts,
+# then spikes line its outer wall one by one, clockwise from the top-left. A second later they
+# start coming off: one turns to Charlie, blinks red for a second and flies that way, through
+# anything. They start one a second, getting quicker until a third of them have flown. Then
+# that stops and the Bob blasters come, in sets around Charlie (see BLASTER), while half of the
+# spikes left turn red one by one, counterclockwise from the bottom left, and vanish.
+ROOM = O(lineRate=14, pause=1, blink=1, speed=12 * T, firstGap=1, lastGap=0.28, stopAfter=1 / 3, redRate=14, redTime=0.25)
+# A blaster: Bob's skull, its mouth (the jaw side of the pictures) aimed at where Charlie was when
+# it came. One second later it fires a beam; right after, it picks the spot Charlie is at then,
+# rushes there and bursts into dots. sets: n blasters, off: degrees of the first, dist: tiles from Charlie.
+# px: screen pixels per picture pixel (72 tall, twice Bob); jawOpen: how far the jaw drops (picture pixels).
+BLASTER = O(sets=[O(n=4, off=0, dist=4), O(n=4, off=45, dist=8), O(n=6, off=0, dist=12)], gap=0.4,
+            charge=1, beam=0.25, beamW=48, beamL=1400, speed=40 * T, dots=12, dotSpeed=8 * T,
+            px=72 / 15, jawOpen=10)
+
+
+def startSpikeRoom(id, delay):
+    r = next((o for o in spikeRooms if o.id == id), None)
+    if r and not r.phase:
+        r.update(phase='wait', t=delay)
+
+
+# Shut it: the walls go back the way they were built (no dug-out escape routes), the openings
+# fill with dirt, and the way round its outer wall is worked out.
+def shutSpikeRoom(r):
+    bx0, by0, bx1, by1 = r.box
+    for y in range(by0, by1 + 1):
+        for x in range(bx0, bx1 + 1):
+            grid[y][x] = baseGrid[y][x]
+    for x, y in r.seal:
+        grid[y][x] = 'g'
+    if r.lower:
+        startSlab(r.lower)
+
+    def is_open(x, y):
+        return bx0 <= x <= bx1 and by0 <= y <= by1 and not isSolidChar(grid[y][x])
+    # keep the left hand on the wall: clockwise, and anything standing free in the room is skipped
+    dirs = ((1, 0), (0, 1), (-1, 0), (0, -1))
+    seen = set()
+    x, y = r.start
+    d = 0
+    r.line = []
+    for step in range(20000):
+        k = y * LW + x
+        if k not in seen:
+            seen.add(k)
+            if not (is_open(x + 1, y) and is_open(x - 1, y) and is_open(x, y + 1) and is_open(x, y - 1)):   # (only tiles right against a wall)
+                r.line.append([x, y])
+        nd = next(((d + t) % 4 for t in (3, 0, 1, 2) if is_open(x + dirs[(d + t) % 4][0], y + dirs[(d + t) % 4][1])), None)
+        if nd is None:
+            break
+        d = nd
+        if step and x == r.start[0] and y == r.start[1] and d == 0:
+            break
+        x += dirs[d][0]; y += dirs[d][1]
+    r.update(placed=0, started=0, launched=0, spikes=[], left=r.line[:], blasters=[], dots=[], set=0, opened=False, redOrder=[], reds=[], redT=0)
+    if P.state != 'dead' and rectHitsSolid(P.x, P.y, P.w, P.h):
+        die()   # caught in the closing wall
+
+
+def updateSpikeRooms(dt):
+    global shake
+    cx, cy = P.x + P.w / 2, P.y + P.h / 2
+    for r in spikeRooms:
+        if not r.phase or r.phase == 'done':
             continue
-        b = bobTalkBox(n)
-        if not b or b.inView:
+        if r.lower:
+            for n in npcs:
+                if n.kind == 'bobTalk':
+                    n.feet = n.home + r.lower.p * T
+        r.t -= dt
+        if r.phase == 'wait':
+            if r.t > 0:
+                continue
+            shutSpikeRoom(r); shake = 8
+            r.phase = 'line'; r.t = 0
+        if r.phase == 'line':
+            while r.t <= 0 and r.placed < len(r.line):
+                x, y = r.line[r.placed]
+                r.placed += 1
+                grid[y][x] = '^'
+                r.t += 1 / ROOM.lineRate
+            if r.placed >= len(r.line):
+                r.phase = 'pause'; r.t = ROOM.pause
             continue
-        pad, k = 10, 0.8
-        w, h = b.w * k + pad * 2, (b.h + 26) * k + pad * 2
-        bx = max(10, min(VIEW_W - w - 10, n.x - camX - w / 2))
-        by = 60 if n.feet < camY + VIEW_H / 2 else VIEW_H - h - 60   # (clear of the HUD)
-        ctx.fillStyle = 'rgba(20,22,26,0.72)'
-        ctx.beginPath(); ctx.roundRect(bx, by, w, h, 8); ctx.fill()
-        ctx.save(); ctx.translate(bx + pad, by + pad); ctx.scale(k, k)
-        drawPixelText('BOB:', 0, 0, '#ffb27a')
-        drawPixelText(b.text, 0, 26, '#ffffff')
-        ctx.restore()
+        if r.phase == 'pause':
+            if r.t <= 0:
+                r.phase = 'launch'; r.t = 0
+            continue
+        if r.phase == 'launch':
+            # the next one turns to Charlie (only while he's in the room to aim at); ones he's inhaled are gone
+            tx, ty = math.floor(cx / T), math.floor(cy / T)
+            here = P.state != 'dead' and r.box[0] <= tx <= r.box[2] and r.box[1] <= ty <= r.box[3]
+            stop = math.ceil(len(r.line) * ROOM.stopAfter)
+            r.left = [c for c in r.left if grid[c[1]][c[0]] == '^']
+            if r.t <= 0 and r.started < stop and r.left and here:
+                x, y = r.left.pop(int(random() * len(r.left)))
+                grid[y][x] = '.'
+                sx, sy = x * T + T / 2, y * T + T / 2
+                r.spikes.append(O(x=sx, y=sy, ang=math.atan2(cy - sy, cx - sx), blink=ROOM.blink))
+                r.started += 1
+                r.t = ROOM.firstGap + (ROOM.lastGap - ROOM.firstGap) * min(1, (r.started - 1) / max(1, stop - 2))
+            if r.launched >= stop or (not r.left and not any(s.blink > 0 for s in r.spikes)):
+                r.phase = 'blast'; r.t = 0
+                startRedSweep(r)
+        if r.phase == 'blast' and r.t <= 0 and r.set < len(BLASTER.sets):
+            spawnBlasters(r, BLASTER.sets[r.set])
+            r.set += 1
+            r.t = BLASTER.gap
+        if r.phase == 'blast':
+            updateRedSweep(r, dt)
+        x0, y0, x1, y1 = r.bounds
+        for s in r.spikes:
+            if s.blink > 0:
+                s.blink -= dt
+                if s.blink <= 0:
+                    r.launched += 1
+            else:
+                s.x += math.cos(s.ang) * ROOM.speed * dt; s.y += math.sin(s.ang) * ROOM.speed * dt
+            if P.state != 'dead' and overlap(P.x + 3, P.y + 3, P.w - 6, P.h - 6, s.x - 9, s.y - 9, 18, 18):
+                hurt()
+        r.spikes = [s for s in r.spikes if x0 <= s.x < x1 and y0 <= s.y < y1]
+        updateBlasters(r, dt)
+        r.dots = [o for o in r.dots if x0 <= o.x < x1 and y0 <= o.y < y1]
+        # the last of it out of the room and Charlie's still standing: the leftover spikes go and the way out opens
+        if r.phase == 'blast' and r.set >= len(BLASTER.sets) and not r.blasters and not r.redOrder and not r.reds:
+            def inRoom(o):
+                return r.box[0] * T <= o.x < (r.box[2] + 1) * T and r.box[1] * T <= o.y < (r.box[3] + 1) * T
+            if not r.opened and not any(inRoom(o) for o in r.dots) and not any(inRoom(o) for o in r.spikes):
+                for x, y in r.left:
+                    if grid[y][x] == '^':
+                        grid[y][x] = '.'
+                        dust(x * T + T / 2, y * T + T, 3)
+                for x, y in r.seal:
+                    grid[y][x] = baseGrid[y][x]
+                r.opened = True
+            if r.opened and not r.dots and not r.spikes:
+                r.phase = 'done'
+
+
+# Half of the spikes still up, in order round the room from the bottom-left corner the other way
+# to how they went up (right along the floor, up the right wall, left along the ceiling...).
+def startRedSweep(r):
+    n = len(r.line)
+    i0 = max(range(n), key=lambda i: r.line[i][1] - r.line[i][0])
+    order = []
+    for j in range(n):
+        c = r.line[(i0 - j + n) % n]
+        if grid[c[1]][c[0]] == '^' and c in r.left:
+            order.append(c)
+    r.redOrder = order[:math.ceil(len(order) / 2)]
+    r.reds = []; r.redT = 0
+
+
+def updateRedSweep(r, dt):
+    r.redT -= dt
+    while r.redT <= 0 and r.redOrder:
+        x, y = r.redOrder.pop(0)
+        if grid[y][x] == '^':   # (unless Charlie's inhaled it)
+            r.reds.append(O(x=x, y=y, t=ROOM.redTime))
+        r.redT += 1 / ROOM.redRate
+    for c in r.reds:
+        c.t -= dt
+        if c.t <= 0 and grid[c.y][c.x] == '^':
+            grid[c.y][c.x] = '.'
+    r.reds = [c for c in r.reds if c.t > 0 and grid[c.y][c.x] == '^']
+
+
+def spawnBlasters(r, st):
+    cx, cy = P.x + P.w / 2, P.y + P.h / 2
+    for i in range(st.n):
+        a = (st.off + i * 360 / st.n) * math.pi / 180
+        r.blasters.append(O(x=cx + math.cos(a) * st.dist * T, y=cy + math.sin(a) * st.dist * T, ang=a + math.pi, t=0, state='charge'))
+
+
+def updateBlasters(r, dt):
+    global shake
+    cx, cy, B = P.x + P.w / 2, P.y + P.h / 2, BLASTER
+    for b in r.blasters:
+        b.t += dt
+        if b.state == 'charge':
+            if b.t >= B.charge:
+                b.state = 'beam'; shake = max(shake, 3)
+        elif b.state == 'beam':
+            # the beam: anything of Charlie's within reach of the line, out in front of the mouth
+            dx, dy = cx - b.x, cy - b.y
+            along = dx * math.cos(b.ang) + dy * math.sin(b.ang)
+            off = abs(dx * math.sin(b.ang) - dy * math.cos(b.ang))
+            if P.state != 'dead' and 0 < along < B.beamL and off < B.beamW / 2 + P.w / 2 - 3:
+                hurt()
+            if b.t >= B.charge + B.beam:
+                b.state = 'fly'; b.tx = cx; b.ty = cy
+        else:
+            ex, ey = b.tx - b.x, b.ty - b.y
+            d, step = math.hypot(ex, ey), B.speed * dt
+            if d > step:
+                b.x += ex / d * step; b.y += ey / d * step
+                continue
+            b.gone = True; shake = max(shake, 4)
+            for i in range(B.dots):
+                a = i / B.dots * math.pi * 2
+                r.dots.append(O(x=b.tx, y=b.ty, vx=math.cos(a) * B.dotSpeed, vy=math.sin(a) * B.dotSpeed))
+    r.blasters = [b for b in r.blasters if not b.gone]
+    for o in r.dots:
+        o.x += o.vx * dt; o.y += o.vy * dt
+        if P.state != 'dead' and overlap(P.x + 3, P.y + 3, P.w - 6, P.h - 6, o.x - 5, o.y - 5, 10, 10):
+            hurt()
+
+
+# Its two pictures, joined: the jaw sits under the head with the head's nub in its notch. It's
+# turned so the line it fires along runs between them: the mouth opens to either side of the
+# line, and the beam comes out through the gap.
+def drawBlaster(b):
+    B = BLASTER
+    k = B.px * min(1, b.t / 0.15)
+    opn = B.jawOpen * max(0, min(1, (b.t - B.charge * 0.4) / (B.charge * 0.6)))
+    ctx.save()
+    ctx.translate(b.x, b.y); ctx.rotate(b.ang)
+    if b.state == 'beam':
+        w = B.beamW * (1 - 0.5 * (b.t - B.charge) / B.beam)
+        ctx.fillStyle = '#fff59a'; ctx.fillRect(0, -w * 0.7, B.beamL, w * 1.4)
+        ctx.fillStyle = '#faee11'; ctx.fillRect(0, -w / 2, B.beamL, w)
+    ctx.imageSmoothingEnabled = False
+    ctx.drawImage(blasterBottomImg, 24, 28, 14, 5, -7 * k, opn / 2 * k, 14 * k, 5 * k)
+    ctx.drawImage(blasterTopImg, 26, 22, 14, 12, -7 * k, (-10 - opn / 2) * k, 14 * k, 12 * k)
+    ctx.imageSmoothingEnabled = True
+    ctx.restore()
+
+
+def drawSpikeRooms():
+    for r in spikeRooms:
+        if r.phase not in ('launch', 'blast'):
+            continue
+        for c in r.reds:
+            drawSpike(c.x * T + T / 2, c.y * T + T / 2, spikeTurn(c.x, c.y), '#e02020')
+        for s in r.spikes:
+            drawSpike(s.x, s.y, s.ang + math.pi / 2, '#e02020' if s.blink > 0 and math.floor(s.blink * 8) % 2 else None)
+        for b in r.blasters:
+            drawBlaster(b)
+        ctx.fillStyle = '#faee11'
+        for o in r.dots:
+            ctx.beginPath(); ctx.arc(o.x, o.y, 6, 0, math.pi * 2); ctx.fill()
 
 
 # --- black hole doors (t.holeDoor): a black blot with a soft dark rim, slowly breathing
@@ -5328,11 +5910,12 @@ def drawHole(d):
     ctx.beginPath(); ctx.ellipse(cx, cy, d.w / 2 * k, d.h / 2 * k, 0, 0, math.pi * 2); ctx.fill()
 
 
-# Through a door to another door in the same area: everything stays.
+# Through a door to another door in the same area: everything stays, the clouds start over.
 def throughLocalDoor(d):
     o = next((x for x in doors if x.id == d.here), None)
     if o:
         placeCharlie(o.x + o.w / 2, o.y + o.h)
+        resetMovers()
 
 
 def placeCharlie(cx, feet):
@@ -5351,36 +5934,24 @@ def behindEndlessWall(x, y):
     return False
 
 
-# --- endless walls (t.endlessWall): from one side, the column next to the wall is drawn again
-# and again over the wall and everything past it, as if the place went on forever.
-def drawEndlessWalls(sx, sy):
-    if not endlessWalls:
-        return
+# --- endless walls (t.endlessWall): from one side, the wall and everything past it are covered
+# with solid dirt and a row of cobblestone along the bottom, as if it went on forever.
+def drawEndlessWalls():
     cx = P.x + P.w / 2
     for e in endlessWalls:
         left, right = cx < e.x0 * T, cx >= (e.x1 + 1) * T
         if not left and not right:
             continue
-        src = e.x0 - 1 if left else e.x1 + 1
         vx0, vx1 = math.floor(camX / T) - 1, math.ceil((camX + VIEW_W) / T) + 1
         frm, to = (max(e.x0, vx0), vx1) if left else (vx0, min(e.x1, vx1))
         ty0, ty1 = max(e.y0, math.floor(camY / T) - 1), min(e.y1, math.ceil((camY + VIEW_H) / T) + 1)
         if frm > to or ty0 > ty1:
             continue
-        # the sky / backdrop first, only over the part being covered
-        ctx.save()
-        ctx.setTransform()
-        ctx.clip_rect(frm * T - camX - sx, ty0 * T - camY - sy, (to - frm + 1) * T, (ty1 - ty0 + 1) * T)
-        drawBackdrop()
-        ctx.translate(-round(camX + sx), -round(camY + sy))
-        for ty in range(ty0, ty1 + 1):
-            c, bg = grid[ty][src], bgAt(src, ty)
+        ctx.fillStyle = COL.dirt
+        ctx.fillRect(frm * T, ty0 * T, (to - frm + 1) * T, (ty1 - ty0 + 1) * T)
+        if ty1 == e.y1:
             for tx in range(frm, to + 1):
-                if bg:
-                    ctx.fillStyle = COL.dirtBg; ctx.fillRect(tx * T, ty * T, T + 1, T + 1)
-                if c != '.' and c != 'c':
-                    drawTile(c, tx * T, ty * T, src, ty)
-        ctx.restore()
+                drawTile('o', tx * T, e.y1 * T, tx, e.y1)
 
 
 # --- winged treats (t.wingedTreat)
@@ -5404,6 +5975,8 @@ def updateWingTreats(dt):
             continue
         w.t = 4
         eatTreat(); P.wings = True
+        if P.state in ('dive', 'smash'):
+            P.state = 'normal'
         for i in range(12):
             spawnParticle(w.x, w.y, (random() - 0.5) * 220, (random() - 0.5) * 220, 0.5, 3, '#ffffff' if i % 2 else '#7bb661', 0)
 
@@ -5428,79 +6001,616 @@ def drawWings(x, y, rate, s):
         ctx.restore()
 
 
-# --- falling ceilings (t.dropCeiling). It moves down the grid a tile at a time (so it's solid
-# like any ground) and is drawn between the steps where it really is; its spikes hurt from there.
-def slabAt(tx, ty):
-    for sl in slabs:
-        if sl.moving and sl.x0 <= tx <= sl.x1 and sl.y0 + sl.row <= ty < sl.y0 + sl.row + sl.h and \
-                sl.cells[ty - sl.y0 - sl.row][tx - sl.x0] != '.':
-            return True
-    return False
-
-
-def slabStep(sl):
-    w = sl.x1 - sl.x0 + 1
-    for r in range(sl.h):   # lift it out, putting back what it covered
-        for i in range(w):
-            if sl.cells[r][i] == '.':
-                continue
-            ty, tx = sl.y0 + sl.row + r, sl.x0 + i
-            grid[ty][tx] = sl.under.pop(ty * LW + tx, '.')
-    sl.row += 1
-    for r in range(sl.h):   # and down a row
-        for i in range(w):
-            if sl.cells[r][i] == '.':
-                continue
-            ty, tx = sl.y0 + sl.row + r, sl.x0 + i
-            sl.under[ty * LW + tx] = grid[ty][tx]
-            grid[ty][tx] = sl.cells[r][i]
-    if P.state != 'dead' and rectHitsSolid(P.x, P.y, P.w, P.h):
-        die()   # squashed
+# --- falling ceilings (t.dropCeiling). Once set off, its tiles leave the grid and it's drawn and
+# checked on its own, so it passes through everything. It holds up whoever lands on top of it.
+# A sinking one (land) goes back into the grid where it stops, and can't squash anyone.
+def startSlab(s):
+    global shake
+    s.cells = [grid[s.y0 + r][s.x0:s.x1 + 1] for r in range(s.h)]
+    s.turns = [[spikeTurn(s.x0 + i, s.y0 + r) if c == '^' else 0 for i, c in enumerate(s.cells[r])] for r in range(s.h)]
+    for r in range(s.h):
+        for x in range(s.x0, s.x1 + 1):
+            grid[s.y0 + r][x] = '.'
+    s.moving = True; shake = 4
 
 
 def updateSlabs(dt):
-    global shake
-    for sl in slabs:
-        if not sl.moving:
-            if sl.row or sl.cells or P.state == 'dead':
+    for s in slabs:
+        if not s.moving:
+            if s.trig is None or s.cells or P.state == 'dead':
                 continue   # (already came down)
-            if not overlap(P.x, P.y, P.w, P.h, sl.x0 * T, sl.trig * T, (sl.x1 - sl.x0 + 1) * T, T):
-                continue
-            sl.cells = [grid[sl.y0 + r][sl.x0:sl.x1 + 1] for r in range(sl.h)]
-            # it can come down until the row under it has something solid in it
-            sl.max = 0
-            while sl.y0 + sl.h + sl.max < GH and not any(isSolidChar(c) for c in grid[sl.y0 + sl.h + sl.max][sl.x0:sl.x1 + 1]):
-                sl.max += 1
-            sl.moving = sl.max > 0
-            shake = 4
+            if overlap(P.x, P.y, P.w, P.h, s.x0 * T, s.trig * T, (s.x1 - s.x0 + 1) * T, T):
+                startSlab(s)
             continue
-        sl.p = min(sl.max, sl.p + sl.speed * dt)
-        while sl.row < math.floor(sl.p):
-            slabStep(sl)
-        if sl.p >= sl.max:
-            sl.moving = False; shake = 6
-        # its spikes, where they are right now
-        off = (sl.p - sl.row) * T
+        s.p += s.speed * dt
+        if s.y0 + s.p >= s.end:   # gone out of the bottom, or come to rest
+            s.moving = False
+            if s.land:
+                s.p = s.end - s.y0
+                for r in range(s.h):
+                    for i in range(s.x1 - s.x0 + 1):
+                        if s.cells[r][i] != '.':
+                            grid[s.end + r][s.x0 + i] = s.cells[r][i]
+                            if s.twin:
+                                grid[s.end + r + s.twin[1]][s.x0 + i + s.twin[0]] = s.cells[r][i]
+            continue
+        if P.state == 'dead':
+            continue
+        off = s.p * T
         hx, hy, hw, hh = P.x + 3, P.y + 3, P.w - 6, P.h - 6
-        hit = False
-        for r in range(sl.h):
-            for i in range(sl.x1 - sl.x0 + 1):
-                if sl.cells[r][i] != '^' or P.state == 'dead':
-                    continue
-                bx, by, bw, bh = spikeBox(sl.x0 + i, sl.y0 + sl.row + r)
-                if overlap(hx, hy, hw, hh, bx, by + off, bw, bh):
-                    hit = True
-        if hit:
+        hit = squash = False
+        for r in range(s.h):
+            for i in range(s.x1 - s.x0 + 1):
+                c, x, y = s.cells[r][i], s.x0 + i, s.y0 + r
+                if c == '^':
+                    bx, by, bw, bh = spikeBox(x, y, s.turns[r][i])
+                    if overlap(hx, hy, hw, hh, bx, by + off, bw, bh):
+                        hit = True
+                elif isSolidChar(c) and overlap(P.x, P.y, P.w, P.h, x * T, y * T + off, T, T):
+                    top = y * T + off
+                    if P.vy >= 0 and P.y + P.h <= top + 12:   # on top of it
+                        P.y = top - P.h; P.vy = 0; P.onGround = True
+                    elif not s.land:
+                        squash = True
+        if squash:
+            die()
+        elif hit:
             hurt()
 
 
 def drawSlabs():
-    for sl in slabs:
-        if not sl.moving:
+    for s in slabs:
+        if not s.moving:
             continue
-        off = (sl.p - sl.row) * T
-        for r in range(sl.h):
-            for i in range(sl.x1 - sl.x0 + 1):
-                c = sl.cells[r][i]
-                if c != '.':
-                    drawTile(c, (sl.x0 + i) * T, (sl.y0 + sl.row + r) * T + off, sl.x0 + i, sl.y0 + sl.row + r)
+        off = s.p * T
+        for r in range(s.h):
+            for i in range(s.x1 - s.x0 + 1):
+                c, px, py = s.cells[r][i], (s.x0 + i) * T, (s.y0 + r) * T + off
+                if c == '^':
+                    drawSpike(px + T / 2, py + T / 2, s.turns[r][i])
+                elif c != '.':
+                    drawTile(c, px, py)
+
+
+# ---------------------------------------------------------------------
+#  Dev mode (V, when play testing a chunk or in debug mode): no gravity, W / S fly up and down,
+#  3x speed, through blocks, and nothing can hurt Charlie. Debug mode: typing DEBUG_WORD in the
+#  start menu's dev mode box turns it on, and nothing turns it off again (until the game is
+#  closed). Save codes made in it are marked (dv), and loading one turns debug mode on.
+# ---------------------------------------------------------------------
+devMode = False
+DEV_SPEED_MULT = 3
+debugMode = False
+DEBUG_WORD = 'vybuggyv'
+moverTime = 0.0
+
+
+def turnOnDebug():
+    global debugMode
+    debugMode = True
+    devBox.focus = False
+
+
+def devAllowed():
+    return bool(TEST_CODE) or debugMode
+
+
+# Dev mode movement: fly straight where the keys point, at 3x run speed, through everything.
+# Pickups still work.
+def devFly(dt):
+    sp = PHYS.runMax * DEV_SPEED_MULT
+    dir = (1 if held('right') else 0) - (1 if held('left') else 0)
+    vdir = (1 if held('down') else 0) - (1 if held('up') else 0)
+    P.vx = dir * sp; P.vy = vdir * sp
+    P.x += P.vx * dt; P.y += P.vy * dt
+    if dir:
+        P.facing = dir
+    P.state = 'normal'; P.onGround = False; P.ride = None; P.wallSliding = False; P.flipping = False
+    setLow(False)
+    updateSquash(dt)
+    checkPickups()
+
+
+# Dev mode click: a temporary checkpoint whose pole stands on the clicked spot. Only one at a
+# time, and it's never saved.
+def placeDevCheckpoint(wx, wy):
+    global checkpoints, respawnPoint, lastCp
+    cp = O(x=wx, y=wy, active=True, dev=True)
+    checkpoints = [o for o in checkpoints if not o.dev]
+    for o in checkpoints:
+        o.active = False
+    checkpoints.append(cp)
+    respawnPoint = cp
+    lastCp = O(area=areaName, spot=spotOf(cp.x, cp.y))
+    for _ in range(10):
+        spawnParticle(wx, wy - 40, (random() - 0.5) * 200, (random() - 0.5) * 200, 0.4, 3, '#b07cff', 0)
+
+
+# --- keys and locked doors ---------------------------------------------
+# A key sits at home until Charlie touches it, then trails behind him (through walls).
+# Within 2 tiles of its door it flies into the next empty keyhole. If he dies it drops where
+# he died and falls; landing outside its chunk (or getting buried when the world resets)
+# sends it back home.
+KEY_BOX = 18
+keysPicked = 0   # pick-up order, so the keys line up behind Charlie in turn
+
+
+def keyHole(d, i):
+    return d.x + d.w * (i + 0.5) / d.holes, d.y + d.h * 0.42
+
+
+def resetKey(k):
+    k.update(x=k.hx, y=k.hy, vx=0, vy=0, state='home')
+
+
+def keyOutOfChunk(k):
+    if not k.span:
+        k.span = next((s for s in sectionSpans if s.x0 * T <= k.hx < s.x1 * T and s.y0 * T <= k.hy < s.y1 * T), None)
+    cx, cy, s = k.x + k.w / 2, k.y + k.h / 2, k.span
+    return bool(s) and (cx < s.x0 * T or cx >= s.x1 * T or cy >= s.y1 * T)
+
+
+# Charlie died: the keys behind him drop right there.
+def dropKeys():
+    for k in doorKeys:
+        if k.state != 'follow':
+            continue
+        k.state = 'drop'
+        k.x = P.x + P.w / 2 - k.w / 2; k.y = P.y + P.h / 2 - k.h / 2
+        k.vx = (random() - 0.5) * 120; k.vy = -200
+
+
+# The world just went back the way it was built: keys now inside ground go home.
+def settleKeys():
+    for k in doorKeys:
+        if k.state == 'drop' and solidAt(math.floor((k.x + k.w / 2) / T), math.floor((k.y + k.h / 2) / T)):
+            resetKey(k)
+
+
+def updateKeys(dt):
+    global keysPicked, shake
+    alive, pcx, pcy = P.state != 'dead', P.x + P.w / 2, P.y + P.h / 2
+    for k in doorKeys:
+        if k.state == 'drop':
+            k.vy = min(k.vy + PHYS.gravity * dt, 1400)
+            if k.onGround:
+                k.vx *= max(0, 1 - dt * 10)
+            moveBody(k, dt)
+            if keyOutOfChunk(k):
+                resetKey(k)
+                continue
+        if k.state in ('home', 'drop') and alive and math.hypot(k.x + k.w / 2 - pcx, k.y + k.h / 2 - pcy) < 30:
+            keysPicked += 1
+            k.state = 'follow'; k.order = keysPicked
+            for _ in range(8):
+                spawnParticle(k.x + k.w / 2, k.y + k.h / 2, (random() - 0.5) * 200, (random() - 0.5) * 200, 0.4, 3, '#ffe27a', 0)
+    # the line behind Charlie, each key following the one before it
+    line = sorted((k for k in doorKeys if k.state == 'follow'), key=lambda k: k.order)
+    lx, ly = pcx - P.facing * 26, P.y + 4
+    f = min(1, dt * 9)
+    for k in line:
+        k.x += (lx - k.w / 2 - k.x) * f; k.y += (ly - k.h / 2 - k.y) * f
+        lx, ly = k.x + k.w / 2 - P.facing * 22, k.y + k.h / 2
+        d = k.door
+        if alive and overlap(P.x, P.y, P.w, P.h, d.x - 2 * T, d.y - 2 * T, d.w + 4 * T, d.h + 4 * T):
+            k.state = 'fly'; k.slot = d.next; d.next += 1
+    for i in range(len(doorKeys) - 1, -1, -1):
+        k = doorKeys[i]
+        if k.state != 'fly':
+            continue
+        hx, hy = keyHole(k.door, k.slot)
+        ex, ey = hx - k.w / 2 - k.x, hy - k.h / 2 - k.y
+        step, dist = 520 * dt, math.hypot(ex, ey)
+        if dist > step:
+            k.x += ex / dist * step; k.y += ey / dist * step
+            continue
+        # in it goes, for good
+        k.door.filled += 1
+        stuff.flags[k.id] = True; saveStuff()
+        for _ in range(10):
+            spawnParticle(hx, hy, (random() - 0.5) * 220, (random() - 0.5) * 220, 0.5, 3, '#ffe27a', 0)
+        doorKeys.pop(i)
+    # every hole filled: the keys turn, then the door swings away
+    for i in range(len(lockDoors) - 1, -1, -1):
+        d = lockDoors[i]
+        if d.filled < d.holes:
+            continue
+        d.openT += dt
+        if d.openT < 0.7:
+            continue
+        for tx, ty in d.cells:
+            grid[ty][tx] = '.'; baseGrid[ty][tx] = '.'
+            for j in range(3):
+                spawnParticle(tx * T + random() * T, ty * T + random() * T, (random() - 0.5) * 200, -random() * 180, 0.9,
+                              4 + random() * 3, '#6b4a2b' if j % 2 else '#ffe27a', 900)
+        stuff.flags[d.id] = True; saveStuff()
+        lockDoors.pop(i)
+        shake = 6
+
+
+# A gold key centred at (x, y), lying sideways (rot turns it).
+def drawKey(x, y, rot=0, s=1):
+    ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(s, s)
+    ctx.fillStyle = '#e8b923'; ctx.strokeStyle = '#8a6410'; ctx.lineWidth = 1.5
+    ctx.beginPath(); ctx.arc(-7, 0, 6, 0, math.pi * 2); ctx.fill(); ctx.stroke()   # bow
+    ctx.fillRect(-2, -1.5, 13, 3); ctx.strokeRect(-2, -1.5, 13, 3)                  # shaft
+    ctx.fillRect(6, 1.5, 2.5, 4); ctx.fillRect(10, 1.5, 2.5, 3)                     # teeth
+    ctx.fillStyle = '#8a6410'; ctx.beginPath(); ctx.arc(-7, 0, 2.2, 0, math.pi * 2); ctx.fill()
+    ctx.restore()
+
+
+def drawKeys():
+    for k in doorKeys:
+        cx, cy = k.x + k.w / 2, k.y + k.h / 2
+        if k.state == 'home':
+            bob = math.sin(simTime * 2.5 + k.hx) * 3
+            ctx.fillRadial(cx, cy + bob, 2, 22, [(0, 'rgba(255,226,122,0.6)'), (1, 'rgba(255,226,122,0)')])
+            drawKey(cx, cy + bob, -0.3)
+        elif k.state == 'follow':
+            drawKey(cx, cy, math.sin(simTime * 4 + k.order) * 0.25)
+        else:
+            drawKey(cx, cy, (0 if k.onGround else simTime * 8) if k.state == 'drop' else 0)
+
+
+# A heavy wooden door bound in iron, with a gold plate and keyhole per key.
+# Keys that are in sit in their holes, and turn as the door unlocks.
+def drawLockDoors():
+    for d in lockDoors:
+        if d.x > camX + VIEW_W or d.x + d.w < camX:
+            continue
+        ctx.fillStyle = '#4a3220'; ctx.fillRect(d.x, d.y, d.w, d.h)
+        ctx.fillStyle = '#6b4a2b'; ctx.fillRect(d.x + 3, d.y + 3, d.w - 6, d.h - 3)
+        ctx.fillStyle = '#5a3d23'
+        px = d.x + 3 + T / 2
+        while px < d.x + d.w - 4:   # planks
+            ctx.fillRect(px, d.y + 3, 2, d.h - 3)
+            px += T / 2
+        ctx.fillStyle = '#3b3f46'
+        for fy in (0.15, 0.8):   # iron bands
+            ctx.fillRect(d.x, d.y + d.h * fy, d.w, 6)
+        turn = min(1, d.openT / 0.5) * math.pi / 2
+        for i in range(d.holes):
+            hx, hy = keyHole(d, i)
+            ctx.fillStyle = '#d4a514'; ctx.fillRect(hx - 9, hy - 13, 18, 26)
+            ctx.fillStyle = '#1c1c1c'
+            ctx.beginPath(); ctx.arc(hx, hy - 3, 4, 0, math.pi * 2); ctx.fill()
+            ctx.fillRect(hx - 1.5, hy - 1, 3, 9)
+            if i < d.filled:
+                drawKey(hx, hy, math.pi / 2 + turn, 0.9)
+
+
+# A spiraling portal: blue and purple arms turning inside a glowing ring.
+def drawSwirl(d):
+    cx, cy = d.x + d.w / 2, d.y + d.drawH / 2
+    r = min(d.w, d.drawH) / 2
+    ctx.fillRadial(cx, cy, r * 0.2, r * 1.3, [(0, 'rgba(40,20,90,0.95)'), (0.75, 'rgba(90,60,200,0.6)'), (1, 'rgba(90,160,255,0)')])
+    for a in range(4):
+        ctx.strokeStyle = '#9b6bff' if a % 2 else '#4fc3ff'; ctx.lineWidth = 4
+        ctx.beginPath()
+        for i in range(21):
+            sv = i / 20
+            ang, rad = simTime * 2.4 + a * math.pi / 2 + sv * math.pi * 2.2, r * (0.08 + 0.9 * sv)
+            (ctx.lineTo if i else ctx.moveTo)(cx + math.cos(ang) * rad, cy + math.sin(ang) * rad)
+        ctx.stroke()
+    ctx.strokeStyle = '#b9a4ff'; ctx.lineWidth = 3
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, math.pi * 2); ctx.stroke()
+    if not areaExists(d.to):
+        # padlock in the middle: not open yet
+        ctx.strokeStyle = '#d9dde4'; ctx.lineWidth = 3
+        ctx.beginPath(); ctx.arc(cx, cy - 3, 5, math.pi, 0); ctx.stroke()
+        ctx.fillStyle = '#d9dde4'; ctx.fillRect(cx - 8, cy - 3, 16, 12)
+        ctx.fillStyle = '#2b2f36'; ctx.fillRect(cx - 1.5, cy + 1, 3, 5)
+
+
+# Rails for clouds with track: True, through the middle of the cloud's top (behind the tiles).
+def drawTracks():
+    for m in movers:
+        if not m.track or len(m.pts) < 2:
+            continue
+        pts = [(x + m.w / 2, y + 8) for x, y in m.pts]
+        for col, lw in (('#5d6672', 7), ('#aeb7c2', 3)):
+            ctx.strokeStyle = col; ctx.lineWidth = lw
+            ctx.beginPath()
+            for i, (x, y) in enumerate(pts):
+                (ctx.lineTo if i else ctx.moveTo)(x, y)
+            if m.loop:
+                ctx.closePath()
+            ctx.stroke()
+        ctx.fillStyle = '#5d6672'
+        for x, y in pts:
+            ctx.beginPath(); ctx.arc(x, y, 6, 0, math.pi * 2); ctx.fill()
+
+
+# ---------------------------------------------------------------------
+#  The giant chicken: 20x the size of a normal one. It shows up behind Charlie once he
+#  passes its trigger, and wobbles right along the bottom at 4 tiles a second (slower over
+#  giantSpec.slow), wrecking every block it touches. Getting over or behind it makes it
+#  jump until its head reaches the top. Touching it hurts like a chicken. A death sends
+#  it away and the wrecked blocks come back (respawn restores the grid).
+# ---------------------------------------------------------------------
+GIANT = O(scale=20, speed=4 * T, jumpWait=0.5)
+
+
+def giantBox(g):
+    return O(x=g.x, y=g.feet - CK_H * GIANT.scale, w=CK_W * GIANT.scale, h=CK_H * GIANT.scale)
+
+
+def updateGiant(dt):
+    global giant, shake
+    s = giantSpec
+    if not s:
+        return
+    alive = P.state != 'dead'
+    if not giant:
+        x0, y0, x1, y1 = s.trigger
+        if not s.done and alive and overlap(P.x, P.y, P.w, P.h, x0, y0, x1 - x0, y1 - y0):
+            giant = O(x=s.front - CK_W * GIANT.scale, feet=s.floor, vy=0, onGround=True, wait=0, phase=0)
+            s.done = True
+            shake = 10
+        return
+    g = giant
+    w = CK_W * GIANT.scale
+    front = g.x + w
+    g.phase += dt
+    g.x += (s.slow.speed if s.slow and s.slow.x0 <= front < s.slow.x1 else GIANT.speed) * dt
+    # over it or behind it: jump so its head (the top of the picture) reaches the top
+    g.wait -= dt
+    cx = P.x + P.w / 2
+    if g.onGround and g.wait <= 0 and alive and cx < g.x + w * 0.75:
+        rise = max(0, g.feet - CK_DRAW_H * GIANT.scale - s.top)
+        g.vy = -math.sqrt(2 * PHYS.gravity * rise); g.onGround = False
+    if not g.onGround:
+        g.vy += PHYS.gravity * dt; g.feet += g.vy * dt
+        if g.feet >= s.floor:
+            g.feet = s.floor; g.vy = 0; g.onGround = True; g.wait = GIANT.jumpWait; shake = 8
+    # wreck the blocks it's in, and any chickens
+    b = giantBox(g)
+    tx0, tx1 = max(0, math.floor(b.x / T)), min(LW - 1, math.floor((b.x + b.w) / T))
+    ty0, ty1 = max(0, math.floor(b.y / T)), min(GH - 1, math.floor((b.y + b.h - 1) / T))
+    for ty in range(ty0, ty1 + 1):
+        for tx in range(tx0, tx1 + 1):
+            c = grid[ty][tx]
+            if c in ('.', 'I'):
+                continue
+            grid[ty][tx] = '.'
+            if random() < 0.3:
+                spawnParticle(tx * T + T / 2, ty * T + T / 2, (random() - 0.2) * 300, -random() * 300, 0.6, 4,
+                              '#9aa3ad' if c == '^' else COL.dirt, 900)
+    for ck in chickens:
+        if ck.alive and overlap(ck.x, ck.y, ck.w, ck.h, b.x, b.y, b.w, b.h):
+            killChicken(ck)
+    if alive and overlap(P.x, P.y, P.w, P.h, b.x + 20, b.y + 20, b.w - 40, b.h - 20):
+        hurt()
+    # at its stopping place it bursts into feathers
+    if front >= s.stop:
+        for i in range(80):
+            a, sp = random() * math.pi * 2, 100 + random() * 500
+            spawnParticle(b.x + random() * b.w, b.y + random() * b.h, math.cos(a) * sp, math.sin(a) * sp - 150,
+                          1 + random() * 0.6, 4 + random() * 4, '#f4f1ea' if i % 5 else '#d63031', 500)
+        giant = None; shake = 12
+
+
+def drawGiant():
+    if not giant:
+        return
+    w = CK_W * GIANT.scale
+    cx = giant.x + w / 2
+    rot = math.sin(giant.phase * 7) * 0.09   # wobbling along
+    hop = abs(math.sin(giant.phase * 7)) * 18 if giant.onGround else 0
+    ctx.save()
+    ctx.translate(cx, giant.feet - hop); ctx.scale(GIANT.scale, GIANT.scale)
+    drawChickenAt(0, 0, 1, rot)
+    ctx.restore()
+
+
+# Teleporter pads: touching one moves Charlie to its partner. Arriving on a pad doesn't send
+# him back; it works again once he's stepped off it.
+def updateTeleporters():
+    for tp in teleporters:
+        on = P.state != 'dead' and overlap(P.x, P.y, P.w, P.h, tp.x + 4, tp.y + 4, tp.w - 8, tp.h - 8)
+        if not on:
+            tp.armed = True
+            continue
+        if not tp.armed:
+            continue
+        to = next((o for o in teleporters if o.id == tp.to), None)
+        if not to:
+            continue
+        to.armed = False
+        for i in range(20):
+            spawnParticle(tp.x + T / 2, tp.y + T / 2, (random() - 0.5) * 300, (random() - 0.5) * 300, 0.5, 3,
+                          '#7fd3ff' if i % 2 else '#b07cff', 0)
+        placeCharlie(to.x + T / 2, to.y + T)
+        resetMovers()
+        return
+
+
+def drawTeleporters():
+    for tp in teleporters:
+        cx, cy = tp.x + T / 2, tp.y + T / 2
+        for i in range(3):
+            ctx.strokeStyle = 'rgba(176,124,255,0.9)' if i % 2 else 'rgba(127,211,255,0.9)'; ctx.lineWidth = 3
+            a0 = simTime * (3 + i) + i * 2
+            ctx.beginPath(); ctx.arc(cx, cy, 6 + i * 5, a0, a0 + math.pi * 1.3); ctx.stroke()
+
+
+# ---------------------------------------------------------------------
+#  Pause menu (Esc) and the Achievements screen (1, or A in the pause menu). Both are ui
+#  screens, so the game holds still. Reset and Super Reset only say what they do once you
+#  pick them, and ask first.
+# ---------------------------------------------------------------------
+PAUSE_ITEMS = [
+    O(id='respawn', label='Respawn (R)'),
+    O(id='reset', label='Reset (Enter)'),
+    O(id='super', label='Super Reset (Enter ×5)'),
+    O(id='trophies', label='Achievements (A)'),
+    O(id='menu', label='Main Menu (M)'),
+]
+CONFIRM = {
+    'reset': O(title='Reset?', text='This sends you back to the start of the area you are in and puts everything in it back the way it was. Your checkpoint and the timer start over too. Greenies, diamonds and everything you have kept stay yours.', yes='Reset'),
+    'super': O(title='Super Reset?', text='This erases ALL of your progress: every greenie (challenge greenies too), every diamond, the hat, the backpack, and everything you have opened for good. Then the area starts over. It cannot be undone.', yes='Erase everything'),
+}
+CONFIRM_BOX = O(x=VIEW_W / 2 - 320, y=170, w=640, h=260)
+
+
+def pauseItems():
+    return [it for it in PAUSE_ITEMS if it.id != 'menu' or areaExists('Tutorial')]
+
+
+def pauseButton(i):
+    return O(x=VIEW_W / 2 - 180, y=120 + i * 68, w=360, h=54)
+
+
+def confirmButtons():
+    B = CONFIRM_BOX
+    return [O(id='yes', x=B.x + B.w / 2 - 290, y=B.y + 180, w=280, h=54),
+            O(id='no', x=B.x + B.w / 2 + 10, y=B.y + 180, w=280, h=54)]
+
+
+def openPause():
+    keys.clear(); openUI('pause'); ui.confirm = None
+
+
+def openTrophies(fromPause):
+    keys.clear(); openUI('trophies'); ui.fromPause = fromPause
+
+
+# Back out of the pause / achievements screens one step.
+def pauseBack():
+    if ui.kind == 'pause' and ui.confirm:
+        ui.confirm = None
+    elif ui.kind == 'trophies' and ui.fromPause:
+        openPause()
+    else:
+        closeUI()
+
+
+def pauseDo(id):
+    if id == 'respawn':
+        closeUI()
+        if P.state != 'dead':
+            respawn()
+    elif id in ('reset', 'super'):
+        ui.confirm = id
+    elif id == 'trophies':
+        openTrophies(True)
+    elif id == 'menu':
+        closeUI(); openMenu(makeSaveCode())
+
+
+def confirmYes():
+    which = ui.confirm
+    closeUI()
+    if which == 'super':
+        greeniesGot.clear(); saveGreenies(); resetStuff()
+    restartLevel()
+
+
+def pauseKey(code):
+    if code == 'Escape':
+        pauseBack()
+        return
+    if ui.kind == 'trophies':
+        if code in ('Digit1', 'Numpad1', 'KeyA'):
+            pauseBack()
+        return
+    if ui.confirm:
+        if code == 'Enter':
+            confirmYes()
+        return
+    if code == 'KeyR':
+        pauseDo('respawn')
+    elif code == 'Enter':
+        pauseDo('reset')
+    elif code in ('KeyA', 'Digit1', 'Numpad1'):
+        pauseDo('trophies')
+    elif code == 'KeyM' and areaExists('Tutorial'):
+        pauseDo('menu')
+
+
+def pauseClick(x, y):
+    def hit(b):
+        return overlap(x, y, 1, 1, b.x, b.y, b.w, b.h)
+    if hit(CLOSE_BTN):
+        pauseBack()
+        return
+    if ui.kind != 'pause':
+        return
+    if ui.confirm:
+        b = next((b for b in confirmButtons() if hit(b)), None)
+        if b:
+            if b.id == 'yes':
+                confirmYes()
+            else:
+                ui.confirm = None
+        return
+    for i, it in enumerate(pauseItems()):
+        if hit(pauseButton(i)):
+            pauseDo(it.id)
+            return
+
+
+def drawButton(b, label, fill, textCol='#fff'):
+    ctx.fillStyle = fill; ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, 10); ctx.fill()
+    ctx.fillStyle = textCol; ctx.font = font(700, 20); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+    ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2 + 1)
+
+
+def drawPause():
+    drawTopText('PAUSED', 'Esc to keep playing')
+    hover = cursor if cursor and not ui.confirm else None
+    for i, it in enumerate(pauseItems()):
+        b = pauseButton(i)
+        on = hover and overlap(hover[0], hover[1], 1, 1, b.x, b.y, b.w, b.h)
+        drawButton(b, it.label, '#5cbf4a' if on else 'rgba(255,255,255,0.16)', '#15181d' if on else '#fff')
+    if not ui.confirm:
+        return
+    c, B = CONFIRM[ui.confirm], CONFIRM_BOX
+    ctx.fillStyle = 'rgba(10,12,16,0.6)'; ctx.fillRect(0, 0, VIEW_W, VIEW_H)
+    ctx.fillStyle = '#23272e'; ctx.beginPath(); ctx.roundRect(B.x, B.y, B.w, B.h, 14); ctx.fill()
+    ctx.strokeStyle = '#d63031'; ctx.lineWidth = 3; ctx.stroke()
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+    ctx.fillStyle = '#ff8a80'; ctx.font = font(800, 26); ctx.fillText(c.title, B.x + B.w / 2, B.y + 38)
+    ctx.fillStyle = '#e6e9ee'; ctx.font = font(500, 16)
+    for i, line in enumerate(wrapText(c.text, B.w - 60)):
+        ctx.fillText(line, B.x + B.w / 2, B.y + 82 + i * 22)
+    yes, no = confirmButtons()
+    drawButton(yes, c.yes + ' (Enter)', '#d63031')
+    drawButton(no, 'Cancel (Esc)', 'rgba(255,255,255,0.16)')
+
+
+# A black cut-out of a picture (for challenge greenies you haven't found yet).
+_silhouettes = {}
+
+
+def silhouette(img):
+    k = id(img)
+    if k not in _silhouettes:
+        sil = img.surf.copy()
+        sil.fill((0, 0, 0), special_flags=pygame.BLEND_RGB_MULT)
+        _silhouettes[k] = Img.__new__(Img)
+        _silhouettes[k].surf = sil
+    return _silhouettes[k]
+
+
+def drawTrophies():
+    got = sum(1 for c in CHALLENGES if c.id in greeniesGot)
+    drawTopText('ACHIEVEMENTS', 'Challenge greenies: %d / %d   ·   1 or Esc to close' % (got, len(CHALLENGES)))
+    cw, ch, gap = 200, 250, 24
+    cols = min(5, max(1, len(CHALLENGES)))
+    for i, c in enumerate(CHALLENGES):
+        row, col = i // cols, i % cols
+        n = min(cols, len(CHALLENGES) - row * cols)
+        x = VIEW_W / 2 - (n * cw + (n - 1) * gap) / 2 + col * (cw + gap)
+        y = 110 + row * (ch + gap)
+        have, img = c.id in greeniesGot, challengeImgs.get(c.img)
+        ctx.fillStyle = 'rgba(160,215,255,0.18)' if have else 'rgba(255,255,255,0.07)'
+        ctx.beginPath(); ctx.roundRect(x, y, cw, ch, 12); ctx.fill()
+        if img and img.naturalWidth:
+            h = 160
+            w = h * img.naturalWidth / img.naturalHeight
+            ctx.drawImage(img if have else silhouette(img), x + cw / 2 - w / 2, y + 18, w, h)
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+        ctx.fillStyle = '#fff' if have else 'rgba(255,255,255,0.5)'; ctx.font = font(700, 16)
+        for j, line in enumerate(wrapText(c.name if have else '???', cw - 20)[:2]):
+            ctx.fillText(line, x + cw / 2, y + 200 + j * 20)

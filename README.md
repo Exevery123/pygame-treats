@@ -2,8 +2,10 @@
 
 A copy of Treats (the browser game in `..\treatsthegame`) written in Python with pygame.
 Everything plays the same: the same moves and physics numbers, the same areas and chunks,
-chickens, inhaling, fireballs, secrets, doors, the closet, chest and backpack, Bob, Grandma,
-the Easy / Hard choice and the save codes.
+chickens, inhaling (fireballs too), secrets, doors, the closet, chest and backpack, Bob, Grandma,
+the Easy / Hard choice and the save codes. Sky Islands (clouds, keys and the lock door), the Cloud
+Challenge (giant chicken, teleporters, challenge greenie), Greenie Temples Part 2 (wings, black holes,
+the falling ceiling, Bob's spike trap), the pause menu (Esc), Achievements (1) and dev / debug mode (V) are all in.
 
 ## Run it
 
@@ -34,8 +36,6 @@ Text, Chicken, Fireball, Cloud, Note and Eraser. Other chunks, **Generate world*
 the main world around yours, where it is in the game) and Copy level are in there too.
 **Play** (P) opens the chunk in the game in a new window. **Get code** copies the chunk code
 and **Load code** reads one from the clipboard. Your chunk is kept in `save_data.json` between runs.
-
-Clouds can be placed and edited, but the Python game doesn't build them yet, so they don't show up in Play.
 
 ## Files
 
